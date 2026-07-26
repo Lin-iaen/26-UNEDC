@@ -13,3 +13,7 @@ build/
 .env
 *.log
 samples/
+
+# Claude Code 本机配置与临时文件
+.claude/settings.local.json
+.claude/*.tmp.*

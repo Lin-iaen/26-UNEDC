@@ -13,9 +13,18 @@ import signal
 import sys
 import time
 from enum import Enum, auto
+from pathlib import Path
 
-from src.drivers import Camera, BaseCANMotor
-from src.vision import BaseTracker, MjpegStreamer
+import numpy as np
+
+# Allow `python src/main.py` as well as `python -m src.main`: in the former,
+# sys.path[0] is src/ and the `src` package itself would not be importable.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.drivers import Camera, BaseCANMotor  # noqa: E402 — after sys.path bootstrap
+from src.vision import BaseTracker, MjpegStreamer  # noqa: E402
 
 logger = logging.getLogger("main")
 
@@ -80,8 +89,6 @@ def main() -> None:
     camera: Camera | None = None
     motor: BaseCANMotor | None = None
     tracker: BaseTracker | None = None
-
-    import numpy as np  # noqa: E402 — lazy import for type annotation only
 
     # Shared buffer: main loop writes, streamer pulls via frame_provider
     _latest_annotated: np.ndarray | None = None
@@ -161,10 +168,13 @@ def main() -> None:
 
         if camera is not None:
             try:
-                camera.stop()
-                logger.info("Camera stopped")
+                # release(), not stop(): stop() halts the stream but leaves the
+                # Picamera2 handle open, so the next run fails to acquire the
+                # sensor until this process dies.
+                camera.release()
+                logger.info("Camera released")
             except Exception:
-                logger.exception("Camera stop failed")
+                logger.exception("Camera release failed")
 
         if motor is not None:
             try:

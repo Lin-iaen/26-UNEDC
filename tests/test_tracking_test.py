@@ -497,7 +497,11 @@ _rect_count = 0
 def main() -> None:
     global _frame_count, _fps, _last_ts, _latest_error, _rect_count
 
-    cam = Camera(vflip=True, sensor_size=(1280, 720))
+    # 全画幅（默认）。原来写的 sensor_size=(1280,720) 一直被静默忽略——读
+    # sensor_modes 会冲掉 configure()，所以实际跑的是全画幅，参数也是在全画幅
+    # 下调的。修复后该参数会真生效并把视场压到约 19%，故直接去掉以保持一致。
+    # 若确实想要 720p 输出（而非裁视场），用 output_size=(1280, 720)。
+    cam = Camera(vflip=True)
     cam.start()
 
     time.sleep(1.5)

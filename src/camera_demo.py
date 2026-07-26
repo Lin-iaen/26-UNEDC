@@ -9,76 +9,92 @@ Usage:
 """
 
 import argparse
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 import cv2
-import numpy as np
-from picamera2 import Picamera2
 
-SAMPLES_DIR = Path(__file__).resolve().parent.parent / "samples"
+# Run directly as `python src/camera_demo.py`: sys.path[0] is src/, not the
+# project root, so `src.drivers` would not be importable without this.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.drivers import Camera  # noqa: E402 — must follow the sys.path bootstrap
 
-def apply_flip(frame: np.ndarray, vflip: bool, hflip: bool) -> np.ndarray:
-    if vflip and hflip:
-        return cv2.flip(frame, -1)
-    if vflip:
-        return cv2.flip(frame, 0)
-    if hflip:
-        return cv2.flip(frame, 1)
-    return frame
-
-
-def capture_single(cam, vflip, hflip):
-    cfg = cam.create_still_configuration()
-    cam.configure(cfg)
-    cam.start()
-    frame = cam.capture_array()
-    cam.stop()
-    frame = apply_flip(frame, vflip, hflip)
-    save_image(frame)
+SAMPLES_DIR = PROJECT_ROOT / "samples"
 
 
 def save_image(frame):
     SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = SAMPLES_DIR / f"capture_{ts}.jpg"
-    bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-    cv2.imwrite(str(path), bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    cv2.imwrite(str(path), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
     print(f"Saved: {path}")
 
 
-def run_test(cam, count, vflip, hflip):
-    cam.configure(cam.create_preview_configuration())
-    cam.start()
+def capture_single(cam: Camera):
+    frame = cam.read()
+    if frame is not None:
+        save_image(frame)
+    else:
+        print("No frame captured")
+
+
+def run_test(cam: Camera, count: int, timeout: float = 5.0):
+    """Measure real capture FPS.
+
+    ``cam.read()`` hands back the cached frame, so looping on it alone measures
+    memcpy speed (tens of thousands of "FPS"), not the sensor.  Wait for
+    ``frame_id`` to advance so each counted frame is a genuinely new one.
+    """
     print(f"Capturing {count} frames ...")
+    captured = 0
+    last_id = cam.frame_id
+    last_new = time.perf_counter()
     start = time.perf_counter()
-    for i in range(count):
-        frame = cam.capture_array()
-        if i == count - 1:
-            frame = apply_flip(frame, vflip, hflip)
+
+    while captured < count:
+        current_id = cam.frame_id
+        if current_id == last_id:
+            if time.perf_counter() - last_new > timeout:
+                print(f"  no new frame for {timeout:.0f}s — aborting")
+                break
+            time.sleep(0.001)
+            continue
+
+        last_id = current_id
+        last_new = time.perf_counter()
+        frame = cam.read()
+        if frame is None:
+            continue
+
+        captured += 1
+        if captured == count:
             save_image(frame)
-        print(f"  {i+1}/{count}  shape={frame.shape} dtype={frame.dtype}")
+        print(f"  {captured}/{count}  shape={frame.shape} dtype={frame.dtype}")
+
     elapsed = time.perf_counter() - start
-    fps = count / elapsed
-    print(f"\nResult: {count} frames in {elapsed:.2f}s = {fps:.1f} FPS")
+    if captured == 0 or elapsed <= 0:
+        print("\nResult: no frames captured")
+        return
+    print(f"\nResult: {captured} frames in {elapsed:.2f}s = {captured / elapsed:.1f} FPS")
 
 
-def run_stream(cam, vflip, hflip, host="0.0.0.0", port=5000):
+def run_stream(cam: Camera, host: str = "0.0.0.0", port: int = 5000):
     from flask import Flask, Response
-
-    cam.configure(cam.create_preview_configuration())
-    cam.start()
 
     app = Flask(__name__)
 
     def generate():
         while True:
-            frame = cam.capture_array()
-            frame = apply_flip(frame, vflip, hflip)
-            bgr = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
-            _, jpeg = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            frame = cam.read()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+            _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             yield (
                 b"--frame\r\n"
                 b"Content-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n"
@@ -87,7 +103,7 @@ def run_stream(cam, vflip, hflip, host="0.0.0.0", port=5000):
 
     @app.route("/")
     def index():
-        return '<img src="/video_feed" width="100%">'
+        return '<img src="/video_feed" style="max-width:100%;max-height:100vh">'
 
     @app.route("/video_feed")
     def video_feed():
@@ -107,20 +123,22 @@ def main():
     parser.add_argument("--hflip", action="store_true", help="Flip image horizontally")
     args = parser.parse_args()
 
-    if not any([args.capture, args.stream, args.test]):
+    if not any([args.capture, args.stream, args.test is not None]):
         parser.print_help()
         return
 
-    cam = Picamera2()
+    cam = Camera(vflip=args.vflip, hflip=args.hflip)
     try:
+        cam.start()
+        time.sleep(1.0)
         if args.capture:
-            capture_single(cam, args.vflip, args.hflip)
+            capture_single(cam)
         elif args.stream:
-            run_stream(cam, args.vflip, args.hflip)
-        elif args.test:
-            run_test(cam, args.test, args.vflip, args.hflip)
+            run_stream(cam)
+        elif args.test is not None:
+            run_test(cam, args.test)
     finally:
-        cam.close()
+        cam.release()
 
 
 if __name__ == "__main__":
