@@ -29,7 +29,7 @@ import numpy as np
 
 from src.drivers import Camera
 from src.vision import MjpegStreamer
-from src.ball_tracker import calibrate, serial_out, display
+from src.ball_tracker import calibrate, serial_out, display, pipe_detector
 from src.ball_tracker.calibrate import project_to_1d
 from src.ball_tracker.detector_thresh import detect as detect_thresh
 from src.ball_tracker.detector_canny import detect as detect_canny
@@ -135,14 +135,20 @@ def main() -> None:
                 time.sleep(0.005)
                 continue
 
+            pipe = pipe_detector.detect(frame)
+
             cx, cy, radius, debug_img = (
-                detect_thresh(frame) if use_thresh else detect_canny(frame)
+                detect_thresh(frame, pipe=pipe)
+                if use_thresh else detect_canny(frame, pipe=pipe)
             )
 
             pos_mm = None
             if cx is not None:
                 pos_mm = project_to_1d(cx, cy, calib)
                 ser.send(pos_mm)
+
+            if pipe is not None:
+                pipe_detector.draw_overlay(frame, pipe)
 
             out = display.draw_overlay(frame, cx, cy, radius, pos_mm,
                                        current_fps, debug_img, debug_mode)

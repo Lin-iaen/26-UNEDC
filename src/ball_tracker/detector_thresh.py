@@ -2,7 +2,15 @@ import cv2
 import numpy as np
 
 
-def detect(frame: np.ndarray) -> tuple[int, int, int, np.ndarray | None]:
+def detect(frame: np.ndarray,
+           pipe: dict | None = None) -> tuple[int | None, int | None,
+                                              int | None, np.ndarray | None]:
+    """Adaptive-threshold ball detector with optional pipe ROI gating.
+
+    ``pipe`` is the dict returned by :func:`pipe_detector.detect`.
+    When provided, detected candidates are rejected if their center
+    falls outside the pipe masked region.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
 
@@ -40,6 +48,16 @@ def detect(frame: np.ndarray) -> tuple[int, int, int, np.ndarray | None]:
         fill_ratio = area / circle_area if circle_area > 0 else 0
         if fill_ratio < 0.3:
             continue
+
+        # pipe ROI gating
+        if pipe is not None:
+            mask = pipe["roi_mask"]
+            ix, iy = int(cx), int(cy)
+            if 0 <= iy < mask.shape[0] and 0 <= ix < mask.shape[1]:
+                if mask[iy, ix] == 0:
+                    continue
+            else:
+                continue
 
         if circularity > best_circularity:
             best_circularity = circularity

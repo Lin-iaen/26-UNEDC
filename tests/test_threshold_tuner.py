@@ -6,12 +6,8 @@
     python tests/test_threshold_tuner.py
     → 浏览器打开 http://<pi-ip>:5002
 
-也可以在 cage 下 HDMI 输出：
-    sudo XDG_RUNTIME_DIR=/run/user/$(id -u $USER) \
-        cage -- /home/lin/workspace/venv/bin/python tests/test_threshold_tuner.py --cage
-
 支持两种检测器：
-  自适应阈值 (thresh) — blockSize, C, morph_size, min_area, circularity
+  自适应阈值 (thresh) — blockSize, C, morph_size, min_area, max_area, circularity
   Canny+Hough (canny) — low, high, minR, maxR
 """
 
@@ -27,18 +23,19 @@ from flask import jsonify, request
 
 from src.drivers import Camera
 from src.vision import MjpegStreamer
+from src.ball_tracker import pipe_detector
 
 SENSOR_MODE = 1
 OUTPUT_W, OUTPUT_H = 640, 480
 TUNER_PORT = 5002
-
-# ── 可调参数（min, max, step, 默认值）────────────────────────────
+IMG_AREA = OUTPUT_W * OUTPUT_H
 
 THRESH_PARAMS = {
     "blockSize": (11, 51, 2, 21),
     "C": (2, 20, 1, 4),
     "morph_size": (1, 15, 2, 5),
     "min_area": (10, 500, 10, 50),
+    "max_area": (500, 150000, 1000, 90000),
     "circularity": (0.1, 1.0, 0.05, 0.4),
 }
 
@@ -54,11 +51,12 @@ STATE = {
     "params": {k: v[3] for k, v in THRESH_PARAMS.items()},
     "detected": "-",
     "fps": 0.0,
+    "dbg": {},
+    "pipe": None,
 }
 
 
-def apply_thresh(frame: np.ndarray, p: dict) -> tuple[np.ndarray | None,
-                                                       int | None, int | None, int | None]:
+def apply_thresh(frame, p):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blk = int(p["blockSize"]) | 1
     blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
@@ -78,35 +76,66 @@ def apply_thresh(frame: np.ndarray, p: dict) -> tuple[np.ndarray | None,
     h, w = frame.shape[:2]
     img_area = h * w
     min_a = float(p["min_area"])
-    circ = float(p["circularity"])
-    best, best_circ = None, 0.0
+    max_a = float(p["max_area"])
+    circ_th = float(p["circularity"])
+    best = None
+    best_circ = 0.0
+    best_cnt = None
+    best_area_val = 0
+    reject_reason = ""
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_a or area > img_area * 0.3:
+        if area < min_a:
+            reject_reason = f"area={area:.0f}<{min_a:.0f}"
+            continue
+        if area > max_a:
+            reject_reason = f"area={area:.0f}>{max_a:.0f}"
             continue
         peri = cv2.arcLength(cnt, True)
         if peri < 1e-6:
+            reject_reason = "peri=0"
             continue
         circularity = 4 * np.pi * area / (peri * peri)
-        if circularity < circ:
+        if circularity < circ_th:
+            reject_reason = f"circ={circularity:.2f}<{circ_th:.2f}"
             continue
         (cx, cy), radius = cv2.minEnclosingCircle(cnt)
         ca = np.pi * radius * radius
-        if ca > 0 and area / ca < 0.3:
+        fr = area / ca if ca > 0 else 0
+        if fr < 0.3:
+            reject_reason = f"fill={fr:.2f}<0.3"
             continue
         if circularity > best_circ:
             best_circ = circularity
             best = (int(cx), int(cy), int(radius))
+            best_cnt = cnt
+            best_area_val = int(area)
+            reject_reason = ""
 
-    return closed, *(best or (None, None, None))
+    info = f"轮廓:{len(contours)}"
+    if best:
+        info += f"  已识别 area={best_area_val} circ={best_circ:.2f}"
+    elif reject_reason:
+        info += f"  筛除:{reject_reason}"
+    else:
+        info += "  无轮廓"
+
+    STATE["dbg"] = {
+        "n": len(contours),
+        "best": best,
+        "best_cnt": best_cnt,
+        "best_area": best_area_val,
+        "best_circ": best_circ,
+        "reject": reject_reason,
+    }
+
+    return closed, *(best or (None, None, None)), info
 
 
-def apply_canny(frame: np.ndarray, p: dict) -> tuple[np.ndarray | None,
-                                                      int | None, int | None, int | None]:
+def apply_canny(frame, p):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 1.2)
-
     edges = cv2.Canny(blurred, int(p["low"]), int(p["high"]))
 
     circles = cv2.HoughCircles(
@@ -118,15 +147,17 @@ def apply_canny(frame: np.ndarray, p: dict) -> tuple[np.ndarray | None,
     result = edges
     if circles is not None and len(circles[0]) > 0:
         c = circles[0][0]
-        return result, int(c[0]), int(c[1]), int(c[2])
-    return result, None, None, None
+        return result, int(c[0]), int(c[1]), int(c[2]), \
+            f"已识别 {len(circles[0])} 个圆"
+    return result, None, None, None, \
+        f"未检测到圆 (Canny low={int(p['low'])} high={int(p['high'])})"
 
 
 DETECTORS = {"thresh": apply_thresh, "canny": apply_canny}
 PARAM_SETS = {"thresh": THRESH_PARAMS, "canny": CANNY_PARAMS}
 
 
-def make_frame_provider(cam: Camera):
+def make_frame_provider(cam):
     counter = {"n": 0, "last_id": -1}
 
     def provider():
@@ -140,13 +171,39 @@ def make_frame_provider(cam: Camera):
         if frame is None:
             return None
 
+        # ── 管道检测 ────────────────────────────────────────────────
+        pipe = pipe_detector.detect(frame)
+        STATE["pipe"] = (
+            f"pipe W={pipe['width_px']}px @{pipe['axis_angle']:.0f}deg" if pipe
+            else "未检测到管道"
+        )
+
+        # ── Sobel 边缘投影可视化 ──────────────────────────
+        gray_for_sobel = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        sobel_y = cv2.Sobel(gray_for_sobel, cv2.CV_32F, 0, 1, ksize=3)
+        abs_sobel = np.abs(sobel_y)
+        prof = np.sum(abs_sobel, axis=1).astype(np.float32)
+        prof = cv2.GaussianBlur(prof.reshape(-1, 1), (15, 1), 3).flatten()
+        proj_vals = prof / (np.max(prof) + 1e-6)
+
         det = STATE["detector"]
         p = STATE["params"]
-        proc, cx, cy, r = DETECTORS[det](frame, p)
+        proc, cx, cy, r, debug_info = DETECTORS[det](frame, p)
+        dbg = STATE.get("dbg", {})
+
+        # ── 管道 ROI 后处理：排除管道外的误检 ────────
+        if cx is not None and pipe is not None:
+            mask = pipe["roi_mask"]
+            if 0 <= cy < mask.shape[0] and 0 <= cx < mask.shape[1]:
+                if mask[cy, cx] == 0:
+                    cx = cy = r = None
+                    debug_info += "  X pipe"
+            else:
+                cx = cy = r = None
+                debug_info += "  X OOB"
 
         h, w = frame.shape[:2]
 
-        # side-by-side: left = original + overlay, right = processed
         if proc is not None:
             if proc.ndim == 2:
                 proc_bgr = cv2.cvtColor(proc, cv2.COLOR_GRAY2BGR)
@@ -156,21 +213,71 @@ def make_frame_provider(cam: Camera):
         else:
             proc_bgr = np.zeros((h, w, 3), dtype=np.uint8)
 
+        # ── 管道 overlay（无论成败都画，None 时画 "NO PIPE"）─
+        frame = pipe_detector.draw_overlay(frame, pipe)
+
+        # ── Sobel 投影条 + 标签 ───────────────────────
+        bar_w = min(36, w // 10)
+        for yi in range(h):
+            lw = int(proj_vals[yi] * (bar_w - 1))
+            if lw >= 1:
+                cv2.line(proc_bgr, (w - bar_w, yi),
+                         (w - bar_w + lw, yi), (60, 120, 255), 1)
+        cv2.line(proc_bgr, (w - bar_w, 0), (w - bar_w, h - 1), (60, 60, 60), 1)
+        cv2.putText(proc_bgr, "Sobel", (w - bar_w - 36, 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 180), 1)
+        if pipe is not None:
+            for yp in (pipe["y_top"], pipe["y_bottom"]):
+                cv2.line(proc_bgr, (w - bar_w - 4, yp),
+                         (w - 1, yp), (255, 200, 0), 1)
+
+        # ── 球检测绘图 ──────────────────────────────────
+        if cx is not None:
+            best_cnt = dbg.get("best_cnt")
+            if best_cnt is not None:
+                cv2.drawContours(frame, [best_cnt], -1, (0, 180, 255), 2)
+
+            for arr in (frame, proc_bgr):
+                cv2.circle(arr, (cx, cy), r, (0, 255, 0), 2)
+                cv2.circle(arr, (cx, cy), 3, (0, 255, 0), -1)
+                cv2.line(arr, (cx - r - 4, cy), (cx + r + 4, cy),
+                         (0, 255, 0), 1)
+                cv2.line(arr, (cx, cy - r - 4), (cx, cy + r + 4),
+                         (0, 255, 0), 1)
+
+            for yy in range(0, h, 8):
+                cv2.line(proc_bgr, (cx, yy), (cx, min(yy + 4, h - 1)),
+                         (0, 200, 0), 1)
+
+        # ── 拼合 ──────────────────────────────────────────
         out = np.hstack((frame, proc_bgr))
 
+        cv2.putText(out, "--- orig ---", (6, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+        cv2.putText(out, "--- proc ---", (w + 6, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
+
+        # ── status dot (top center) ────────────────────
+        status_color = (0, 255, 0) if cx is not None else (
+            (0, 140, 255) if pipe else (0, 0, 255))
+        cv2.circle(out, (out.shape[1] // 2, 12), 6, status_color, -1)
+        cv2.circle(out, (out.shape[1] // 2, 12), 6, (255, 255, 255), 1)
+
         if cx is not None:
-            for arr, ox in [(frame, 0), (proc_bgr, w)]:
-                cv2.circle(arr, (cx, cy), r, (0, 255, 0), 2)
-                cv2.line(arr, (cx - 6, cy), (cx + 6, cy), (0, 255, 0), 1)
-                cv2.line(arr, (cx, cy - 6), (cx, cy + 6), (0, 255, 0), 1)
+            area_val = dbg.get("best_area", 0)
+            circ_val = dbg.get("best_circ", 0)
+            label = f"[{det}]  ({cx},{cy})  r={r}px  "
+            label += f"area={area_val}  circ={circ_val:.2f}"
+            STATE["detected"] = (
+                f"({cx},{cy}) r={r} a={area_val} c={circ_val:.2f}  已识别"
+                f"  |  {STATE['pipe']}")
+        else:
+            tip = debug_info
+            label = f"[{det}]  {tip}"
+            STATE["detected"] = f"{tip}  |  {STATE['pipe']}"
 
-        label = f"[{det}]  ({cx},{cy}) r={r}" if cx else f"[{det}]  no det"
-        STATE["detected"] = label
-
-        cv2.putText(out, label, (8, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
-        cv2.putText(out, f"{w}x{h}", (out.shape[1] - 100, 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+        cv2.putText(out, label, (8, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
         return out
 
@@ -179,7 +286,7 @@ def make_frame_provider(cam: Camera):
 
 # ── HTML + JS ────────────────────────────────────────────────────────
 
-def build_page() -> str:
+def build_page():
     def _slider_html(items, det):
         rows = []
         for k, v in items:
@@ -214,7 +321,6 @@ h3{{margin:12px 0 6px;font-size:12px;color:#6cf;border-bottom:1px solid #333;pad
 .btn:hover{{background:#3a3a3a}}
 .btn.on{{background:#1a3a1a;border-color:#2a6a2a;color:#8f8}}
 #det_info{{font-size:11px;color:#fa0;margin-top:8px;min-height:14px}}
-.hint{{font-size:10px;color:#777;margin:4px 0}}
 </style></head><body>
 <div id="panel">
 <h3>检测器选择</h3>
@@ -248,8 +354,7 @@ function setP(det, key, val){{
   if(timers[key]) return;
   timers[key] = setTimeout(function(){{
     timers[key] = null;
-    var q = det+'?'+key+'='+pending[key];
-    fetch('/set?'+q).catch(e=>{{}});
+    fetch('/set?'+key+'='+pending[key]).catch(e=>{{}});
   }}, 60);
 }}
 
@@ -336,36 +441,16 @@ def main():
     streamer.start()
     print(f"阈值调参工具 → http://<pi-ip>:{TUNER_PORT}")
 
-    if use_cage:
-        win_name = "Threshold Tuner"
-        cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
-        cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN,
-                              cv2.WINDOW_FULLSCREEN)
-        # show placeholder
-        placeholder = np.zeros((OUTPUT_H * 2, OUTPUT_W * 2, 3), dtype=np.uint8)
-        cv2.putText(placeholder, "Threshold Tuner — use browser at :5002",
-                    (10, OUTPUT_H), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (100, 100, 100), 1)
-        cv2.imshow(win_name, placeholder)
-        cv2.waitKey(1)
-    else:
-        win_name = None
-
     fps_c, fps_t = 0, time.perf_counter()
 
     try:
         while True:
-            if use_cage:
-                cv2.waitKey(50)
-            else:
-                time.sleep(0.05)
-
+            time.sleep(0.05)
             fps_c += 1
             elapsed = time.perf_counter() - fps_t
             if elapsed >= 1.0:
                 STATE["fps"] = round(fps_c / elapsed, 1)
                 fps_c, fps_t = 0, time.perf_counter()
-
     except KeyboardInterrupt:
         pass
     finally:
