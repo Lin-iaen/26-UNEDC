@@ -1,17 +1,25 @@
 /*
- * drm_fb_test — 用 libdrm 分配 dumb buffer → 彩条图案 → drmModeSetCrtc
+ * drm_fb_test — 用 libdrm 分配 dumb buffer → drmModeSetCrtc
  *
  * 编译:
  *   gcc -o tests/drm_fb_test tests/drm_fb_test.c -ldrm
  *
  * 用法:
- *   # 先启动 UVC 流唤醒 HDMI，再运行本程序
- *   ffmpeg -f v4l2 -input_format mjpeg -video_size 640x480 \
- *          -i /dev/video8 -t 30 -f null - &
- *   sleep 4
- *   ./tests/drm_fb_test /dev/dri/card1
+ *   模式 1 — 静态测试图案:
+ *     ./tests/drm_fb_test <DRM_DEV> <CONNECTOR_ID>
+ *     显示 SMPTE 彩条棋盘格，按 Ctrl+C 退出。
  *
- * 程序持续运行直到 Ctrl+C。此时用 ffmpeg 从 /dev/video8 采集即可。
+ *   模式 2 — 从 stdin 推流:
+ *     ./tests/drm_fb_test <DRM_DEV> <CONNECTOR_ID> stream <W> <H>
+ *     从 stdin 读取 BGR24 帧 (W*H*3 字节)，写入 dumb buffer 实现实时显示。
+ *
+ *   典型自环采集流程:
+ *     # 1. 后台 UVC 流唤醒 HDMI
+ *     ffmpeg -f v4l2 -input_format mjpeg -video_size 640x480 \
+ *            -i /dev/video8 -t 30 -f null - &
+ *     sleep 4
+ *     # 2. 运行本程序（摄像头画面通过 stdin 传入）
+ *     python record_loopback.py   # 内部调用本程序 + ffmpeg
  */
 
 #include <stdio.h>
@@ -293,10 +301,6 @@ int main(int argc, char **argv) {
     }
     printf("fb: id=%u pitch=%zu size=%zu\n", fb.fb_id, fb.pitch, fb.size);
 
-    /* 填充图案 */
-    fill_test_pattern(fb.map, mode->hdisplay, mode->vdisplay, fb.pitch);
-    printf("test pattern drawn\n");
-
     /* Set CRTC — 关键步骤 */
     if (drmModeSetCrtc(fd, crtc_id, fb.fb_id, 0, 0,
                        &conn->connector_id, 1, mode) < 0) {
@@ -306,13 +310,125 @@ int main(int argc, char **argv) {
         close(fd);
         return 1;
     }
-    printf("drmModeSetCrtc OK — HDMI should now output test pattern\n");
-    printf("Press Ctrl+C to stop\n");
+    fprintf(stderr, "drmModeSetCrtc OK — HDMI active\n");
 
-    /* 保持运行 */
-    while (keep_running) {
-        sleep(1);
+    /* 判断模式 */
+    int is_stream = (argc > 3 && strcmp(argv[3], "stream") == 0);
+    int stream_w = is_stream && argc > 4 ? atoi(argv[4]) : mode->hdisplay;
+    int stream_h = is_stream && argc > 5 ? atoi(argv[5]) : mode->vdisplay;
+    int fb_w = is_stream ? stream_w : mode->hdisplay;
+    int fb_h = is_stream ? stream_h : mode->vdisplay;
+
+    if (is_stream) {
+        /* 在流模式下使用自定义分辨率创建 framebuffer */
+        /* 先释放之前为 preferred mode 创建的 fb */
+        munmap(fb.map, fb.size);
+        drmModeRmFB(fd, fb.fb_id);
+        /* 创建匹配 stream 尺寸的 dumb buffer */
+        struct drm_mode_destroy_dumb dd = {.handle = fb.handle};
+        drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
+
+        fb = create_dumb_fb(fd, fb_w, fb_h);
+        if (!fb.map || !fb.fb_id) {
+            fprintf(stderr, "failed to create stream-sized dumb buffer\n");
+            goto cleanup;
+        }
+        fprintf(stderr, "stream fb: %dx%d id=%u pitch=%zu\n",
+                fb_w, fb_h, fb.fb_id, fb.pitch);
+
+        /* 构建 640x480@60 的 mode info */
+        drmModeModeInfo stream_mode = {
+            .clock = 25175,
+            .hdisplay = fb_w, .hsync_start = fb_w + 16,
+            .hsync_end = fb_w + 16 + 48, .htotal = fb_w + 16 + 48 + 96,
+            .vdisplay = fb_h, .vsync_start = fb_h + 10,
+            .vsync_end = fb_h + 10 + 2, .vtotal = fb_h + 10 + 2 + 33,
+            .vrefresh = 60,
+            .flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
+            .type = DRM_MODE_TYPE_DRIVER,
+            .name = "",
+        };
+        snprintf(stream_mode.name, sizeof(stream_mode.name),
+                 "%dx%d", fb_w, fb_h);
+
+        if (drmModeSetCrtc(fd, crtc_id, fb.fb_id, 0, 0,
+                           &conn->connector_id, 1, &stream_mode) < 0) {
+            fprintf(stderr, "drmModeSetCrtc (stream) failed: %s\n",
+                    strerror(errno));
+            goto cleanup;
+        }
+        fprintf(stderr, "stream mode set: %dx%d@60\n", fb_w, fb_h);
+        /* 模式 2: 从 stdin 读 BGR24 帧 → 写入 dumb buffer */
+        fprintf(stderr, "stream mode: %dx%d BGR24 from stdin\n",
+                stream_w, stream_h);
+        size_t frame_bytes = (size_t)stream_w * stream_h * 3;
+        uint8_t *bgr = malloc(frame_bytes);
+        if (!bgr) {
+            fprintf(stderr, "malloc failed\n");
+            goto cleanup;
+        }
+
+        while (keep_running) {
+            size_t total = 0;
+            while (total < frame_bytes && keep_running) {
+                ssize_t n = read(STDIN_FILENO, bgr + total,
+                                 frame_bytes - total);
+                if (n <= 0) {
+                    if (total == 0) {
+                        /* 无数据 — 短暂等待后重试 */
+                        usleep(5000);
+                        break;
+                    }
+                    /* 部分数据 — 丢弃不完整帧 */
+                    keep_running = 0;
+                    break;
+                }
+                total += n;
+            }
+            if (total < frame_bytes) {
+                if (keep_running)
+                    continue;  /* 重试读帧 */
+                break;
+            }
+
+            /* BGR24 → XRGB8888 逐行写入 dumb buffer */
+            for (int y = 0; y < stream_h && y < fb_h; y++) {
+                uint32_t *row = (uint32_t *)(fb.map + y * fb.pitch);
+                int src_off = y * stream_w * 3;
+                for (int x = 0; x < stream_w && x < fb_w; x++) {
+                    uint8_t b = bgr[src_off + x * 3];
+                    uint8_t g = bgr[src_off + x * 3 + 1];
+                    uint8_t r = bgr[src_off + x * 3 + 2];
+                    row[x] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+                }
+            }
+
+            /* 强制写入像素 (0,0) 为红色做标记 */
+            uint32_t *p0 = (uint32_t *)(fb.map);
+            p0[0] = 0xFFFF0000;  /* XRGB: B=0, G=0, R=255 */
+
+            /* 通知 DRM 刷新 */
+            drmModeDirtyFB(fd, fb.fb_id, NULL, 0);
+
+            static int frame_count = 0;
+            frame_count++;
+            if (frame_count % 30 == 0) {
+                fprintf(stderr, "  stream: %d frames\n", frame_count);
+            }
+        }
+        free(bgr);
+    } else {
+        /* 模式 1: 静态测试图案 */
+        fill_test_pattern(fb.map, fb_w, fb_h, fb.pitch);
+        fprintf(stderr, "test pattern drawn\n");
+        fprintf(stderr, "Press Ctrl+C to stop\n");
+
+        while (keep_running) {
+            sleep(1);
+        }
     }
+
+cleanup:
 
     /* 清理 */
     drmModeSetCrtc(fd, crtc_id, 0, 0, 0, NULL, 0, NULL);
