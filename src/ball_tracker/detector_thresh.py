@@ -3,66 +3,49 @@ import numpy as np
 
 
 def detect(frame: np.ndarray,
-           pipe: dict | None = None) -> tuple[int | None, int | None,
-                                              int | None, np.ndarray | None]:
-    """Adaptive-threshold ball detector with optional pipe ROI gating.
+           pipe_roi: dict | None = None,
+           ) -> tuple[int | None, int | None,
+                      int | None, np.ndarray | None]:
+    """在管道ROI内找最暗连通块。
 
-    ``pipe`` is the dict returned by :func:`pipe_detector.detect`.
-    When provided, detected candidates are rejected if their center
-    falls outside the pipe masked region.
+    丢掉 circularity / fill_ratio 检查，只按面积+亮度筛选。
+    适用于运动模糊也稳定的策略 —— 管道内最暗的块只能是球。
     """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
 
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 21, 4
-    )
+    if pipe_roi is not None and pipe_roi["y1"] < pipe_roi["y2"]:
+        y1, y2 = pipe_roi["y1"], pipe_roi["y2"]
+        roi_gray = gray[y1:y2, :]
+    else:
+        roi_gray = gray
+        y1 = 0
+
+    blurred = cv2.GaussianBlur(roi_gray, (7, 7), 1.5)
+
+    _, binary = cv2.threshold(blurred, 0, 255,
+                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
 
-    h, w = frame.shape[:2]
-    img_area = h * w
-
-    best = None
-    best_circularity = 0.0
+    h, w = roi_gray.shape[:2]
+    max_area_limit = h * w * 0.3
+    best_cnt = None
+    best_area = 0
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 20 or area > img_area * 0.3:
+        if area < 20 or area > max_area_limit:
             continue
+        if area > best_area:
+            best_area = area
+            best_cnt = cnt
 
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter < 1e-6:
-            continue
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
-        if circularity < 0.4:
-            continue
+    if best_cnt is None:
+        return (None, None, None, closed)
 
-        (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-        circle_area = np.pi * radius * radius
-        fill_ratio = area / circle_area if circle_area > 0 else 0
-        if fill_ratio < 0.3:
-            continue
-
-        # pipe ROI gating
-        if pipe is not None:
-            mask = pipe["roi_mask"]
-            ix, iy = int(cx), int(cy)
-            if 0 <= iy < mask.shape[0] and 0 <= ix < mask.shape[1]:
-                if mask[iy, ix] == 0:
-                    continue
-            else:
-                continue
-
-        if circularity > best_circularity:
-            best_circularity = circularity
-            best = (int(cx), int(cy), int(radius))
-
-    if best is not None:
-        return (*best, closed)
-    return (None, None, None, closed)
+    (cx, cy), radius = cv2.minEnclosingCircle(best_cnt)
+    return (int(cx), int(cy) + y1, int(radius), closed)

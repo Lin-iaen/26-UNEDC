@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""阈值调参工具 —— 实时调节检测参数，边调边看效果。
+"""阈值调参工具 —— 手动固定管道ROI，实时调试球检测参数。
 
 用法：
     source venv/bin/activate
     python tests/test_threshold_tuner.py
     → 浏览器打开 http://<pi-ip>:5002
 
-支持两种检测器：
-  自适应阈值 (thresh) — blockSize, C, morph_size, min_area, max_area, circularity
-  Canny+Hough (canny) — low, high, minR, maxR
+操作：
+    1. 拖动管道ROI滑块固定管道上下边界（黄框）
+    2. 切换 thresh / canny 检测器并调参
+    3. 点击「锁定ROI」保存到 calibration_data/ball_tracker.json
 """
 
 import sys
+import json
 import time
 from pathlib import Path
 
@@ -23,12 +25,16 @@ from flask import jsonify, request
 
 from src.drivers import Camera
 from src.vision import MjpegStreamer
-from src.ball_tracker import pipe_detector
+from src.ball_tracker import calibrate
+
+CALIB_FILE = calibrate.CALIB_FILE
 
 SENSOR_MODE = 1
 OUTPUT_W, OUTPUT_H = 640, 480
 TUNER_PORT = 5002
-IMG_AREA = OUTPUT_W * OUTPUT_H
+
+DEFAULT_Y1 = 200
+DEFAULT_Y2 = 260
 
 THRESH_PARAMS = {
     "blockSize": (11, 51, 2, 21),
@@ -49,93 +55,59 @@ CANNY_PARAMS = {
 STATE = {
     "detector": "thresh",
     "params": {k: v[3] for k, v in THRESH_PARAMS.items()},
+    "roi": {"y1": DEFAULT_Y1, "y2": DEFAULT_Y2},
     "detected": "-",
     "fps": 0.0,
     "dbg": {},
-    "pipe": None,
 }
 
 
-def apply_thresh(frame, p):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blk = int(p["blockSize"]) | 1
-    blurred = cv2.GaussianBlur(gray, (7, 7), 1.5)
+# ── 检测器 (简化版: 只找暗块, 丢掉形状约束) ──────────────────
 
-    thresh = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, blk, float(p["C"])
-    )
+def detect_thresh(frame, y1, y2, p):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    roi_gray = gray[y1:y2, :] if y1 < y2 else gray
+    offset = y1 if y1 < y2 else 0
+
+    blurred = cv2.GaussianBlur(roi_gray, (7, 7), 1.5)
+    _, binary = cv2.threshold(blurred, 0, 255,
+                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     ksize = int(p["morph_size"]) | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-    closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
 
-    h, w = frame.shape[:2]
-    img_area = h * w
+    h, w = roi_gray.shape[:2]
     min_a = float(p["min_area"])
     max_a = float(p["max_area"])
-    circ_th = float(p["circularity"])
-    best = None
-    best_circ = 0.0
     best_cnt = None
-    best_area_val = 0
-    reject_reason = ""
+    best_area = 0
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_a:
-            reject_reason = f"area={area:.0f}<{min_a:.0f}"
+        if area < min_a or area > max_a or area > h * w * 0.3:
             continue
-        if area > max_a:
-            reject_reason = f"area={area:.0f}>{max_a:.0f}"
-            continue
-        peri = cv2.arcLength(cnt, True)
-        if peri < 1e-6:
-            reject_reason = "peri=0"
-            continue
-        circularity = 4 * np.pi * area / (peri * peri)
-        if circularity < circ_th:
-            reject_reason = f"circ={circularity:.2f}<{circ_th:.2f}"
-            continue
-        (cx, cy), radius = cv2.minEnclosingCircle(cnt)
-        ca = np.pi * radius * radius
-        fr = area / ca if ca > 0 else 0
-        if fr < 0.3:
-            reject_reason = f"fill={fr:.2f}<0.3"
-            continue
-        if circularity > best_circ:
-            best_circ = circularity
-            best = (int(cx), int(cy), int(radius))
+        if area > best_area:
+            best_area = area
             best_cnt = cnt
-            best_area_val = int(area)
-            reject_reason = ""
 
     info = f"轮廓:{len(contours)}"
-    if best:
-        info += f"  已识别 area={best_area_val} circ={best_circ:.2f}"
-    elif reject_reason:
-        info += f"  筛除:{reject_reason}"
-    else:
-        info += "  无轮廓"
-
-    STATE["dbg"] = {
-        "n": len(contours),
-        "best": best,
-        "best_cnt": best_cnt,
-        "best_area": best_area_val,
-        "best_circ": best_circ,
-        "reject": reject_reason,
-    }
-
-    return closed, *(best or (None, None, None)), info
+    if best_cnt is not None:
+        (cx, cy), radius = cv2.minEnclosingCircle(best_cnt)
+        info += f"  已识别 area={best_area:.0f}"
+        return closed, int(cx), int(cy) + offset, int(radius), info
+    return closed, None, None, None, info
 
 
-def apply_canny(frame, p):
+def detect_canny(frame, y1, y2, p):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 1.2)
+    roi_gray = gray[y1:y2, :] if y1 < y2 else gray
+    offset = y1 if y1 < y2 else 0
+
+    blurred = cv2.GaussianBlur(roi_gray, (5, 5), 1.2)
     edges = cv2.Canny(blurred, int(p["low"]), int(p["high"]))
 
     circles = cv2.HoughCircles(
@@ -144,20 +116,20 @@ def apply_canny(frame, p):
         minRadius=int(p["minR"]), maxRadius=int(p["maxR"]),
     )
 
-    result = edges
     if circles is not None and len(circles[0]) > 0:
         c = circles[0][0]
-        return result, int(c[0]), int(c[1]), int(c[2]), \
+        return edges, int(c[0]), int(c[1]) + offset, int(c[2]), \
             f"已识别 {len(circles[0])} 个圆"
-    return result, None, None, None, \
-        f"未检测到圆 (Canny low={int(p['low'])} high={int(p['high'])})"
+    return edges, None, None, None, \
+        f"无圆 (low={int(p['low'])} high={int(p['high'])})"
 
 
-DETECTORS = {"thresh": apply_thresh, "canny": apply_canny}
-PARAM_SETS = {"thresh": THRESH_PARAMS, "canny": CANNY_PARAMS}
+DETECTORS = {"thresh": detect_thresh, "canny": detect_canny}
 
 
-def make_frame_provider(cam):
+# ── provider ──────────────────────────────────────────────────
+
+def make_provider(cam):
     counter = {"n": 0, "last_id": -1}
 
     def provider():
@@ -171,36 +143,14 @@ def make_frame_provider(cam):
         if frame is None:
             return None
 
-        # ── 管道检测 ────────────────────────────────────────────────
-        pipe = pipe_detector.detect(frame)
-        STATE["pipe"] = (
-            f"pipe W={pipe['width_px']}px @{pipe['axis_angle']:.0f}deg" if pipe
-            else "未检测到管道"
-        )
-
-        # ── Sobel 边缘投影可视化 ──────────────────────────
-        gray_for_sobel = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        sobel_y = cv2.Sobel(gray_for_sobel, cv2.CV_32F, 0, 1, ksize=3)
-        abs_sobel = np.abs(sobel_y)
-        prof = np.sum(abs_sobel, axis=1).astype(np.float32)
-        prof = cv2.GaussianBlur(prof.reshape(-1, 1), (15, 1), 3).flatten()
-        proj_vals = prof / (np.max(prof) + 1e-6)
-
         det = STATE["detector"]
         p = STATE["params"]
-        proc, cx, cy, r, debug_info = DETECTORS[det](frame, p)
-        dbg = STATE.get("dbg", {})
+        roi = STATE["roi"]
+        y1, y2 = roi["y1"], roi["y2"]
+        if y1 >= y2:
+            y1, y2 = 0, frame.shape[0]
 
-        # ── 管道 ROI 后处理：排除管道外的误检 ────────
-        if cx is not None and pipe is not None:
-            mask = pipe["roi_mask"]
-            if 0 <= cy < mask.shape[0] and 0 <= cx < mask.shape[1]:
-                if mask[cy, cx] == 0:
-                    cx = cy = r = None
-                    debug_info += "  X pipe"
-            else:
-                cx = cy = r = None
-                debug_info += "  X OOB"
+        proc, cx, cy, r, info = DETECTORS[det](frame, y1, y2, p)
 
         h, w = frame.shape[:2]
 
@@ -213,68 +163,38 @@ def make_frame_provider(cam):
         else:
             proc_bgr = np.zeros((h, w, 3), dtype=np.uint8)
 
-        # ── 管道 overlay（无论成败都画，None 时画 "NO PIPE"）─
-        frame = pipe_detector.draw_overlay(frame, pipe)
+        out_frame = frame.copy()
 
-        # ── Sobel 投影条 + 标签 ───────────────────────
-        bar_w = min(36, w // 10)
-        for yi in range(h):
-            lw = int(proj_vals[yi] * (bar_w - 1))
-            if lw >= 1:
-                cv2.line(proc_bgr, (w - bar_w, yi),
-                         (w - bar_w + lw, yi), (60, 120, 255), 1)
-        cv2.line(proc_bgr, (w - bar_w, 0), (w - bar_w, h - 1), (60, 60, 60), 1)
-        cv2.putText(proc_bgr, "Sobel", (w - bar_w - 36, 12),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, (80, 80, 180), 1)
-        if pipe is not None:
-            for yp in (pipe["y_top"], pipe["y_bottom"]):
-                cv2.line(proc_bgr, (w - bar_w - 4, yp),
-                         (w - 1, yp), (255, 200, 0), 1)
+        # ── ROI 矩形 ─────────────────────────────────────
+        cv2.rectangle(out_frame, (0, y1), (w, y2), (255, 200, 0), 2)
+        cv2.putText(out_frame, f"ROI {y1}-{y2}",
+                    (4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.35, (255, 200, 0), 1)
 
-        # ── 球检测绘图 ──────────────────────────────────
+        # ── 球标注 ───────────────────────────────────────
         if cx is not None:
-            best_cnt = dbg.get("best_cnt")
-            if best_cnt is not None:
-                cv2.drawContours(frame, [best_cnt], -1, (0, 180, 255), 2)
-
-            for arr in (frame, proc_bgr):
+            for arr in (out_frame, proc_bgr):
                 cv2.circle(arr, (cx, cy), r, (0, 255, 0), 2)
                 cv2.circle(arr, (cx, cy), 3, (0, 255, 0), -1)
                 cv2.line(arr, (cx - r - 4, cy), (cx + r + 4, cy),
                          (0, 255, 0), 1)
                 cv2.line(arr, (cx, cy - r - 4), (cx, cy + r + 4),
                          (0, 255, 0), 1)
-
             for yy in range(0, h, 8):
                 cv2.line(proc_bgr, (cx, yy), (cx, min(yy + 4, h - 1)),
                          (0, 200, 0), 1)
+            label = f"[{det}]  ({cx},{cy}) r={r}  {info}"
+            STATE["detected"] = f"({cx},{cy}) r={r}  已识别  |  ROI {y1}-{y2}"
+        else:
+            label = f"[{det}]  {info}"
+            STATE["detected"] = f"{info}  |  ROI {y1}-{y2}"
 
-        # ── 拼合 ──────────────────────────────────────────
-        out = np.hstack((frame, proc_bgr))
+        out = np.hstack((out_frame, proc_bgr))
 
         cv2.putText(out, "--- orig ---", (6, 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
         cv2.putText(out, "--- proc ---", (w + 6, 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (80, 80, 80), 1)
-
-        # ── status dot (top center) ────────────────────
-        status_color = (0, 255, 0) if cx is not None else (
-            (0, 140, 255) if pipe else (0, 0, 255))
-        cv2.circle(out, (out.shape[1] // 2, 12), 6, status_color, -1)
-        cv2.circle(out, (out.shape[1] // 2, 12), 6, (255, 255, 255), 1)
-
-        if cx is not None:
-            area_val = dbg.get("best_area", 0)
-            circ_val = dbg.get("best_circ", 0)
-            label = f"[{det}]  ({cx},{cy})  r={r}px  "
-            label += f"area={area_val}  circ={circ_val:.2f}"
-            STATE["detected"] = (
-                f"({cx},{cy}) r={r} a={area_val} c={circ_val:.2f}  已识别"
-                f"  |  {STATE['pipe']}")
-        else:
-            tip = debug_info
-            label = f"[{det}]  {tip}"
-            STATE["detected"] = f"{tip}  |  {STATE['pipe']}"
 
         cv2.putText(out, label, (8, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
@@ -284,104 +204,119 @@ def make_frame_provider(cam):
     return provider
 
 
-# ── HTML + JS ────────────────────────────────────────────────────────
+# ── HTML ──────────────────────────────────────────────────────
 
 def build_page():
-    def _slider_html(items, det):
-        rows = []
-        for k, v in items:
-            rows.append(
-                f'<div class="slider-row">'
-                f'<label>{k} <span id="{det[0]}v_{k}" class="val"></span></label>'
-                f'<input type="range" id="{det[0]}s_{k}" min="{v[0]}" max="{v[1]}" '
-                f'step="{v[2]}" value="{v[3]}" '
-                f'oninput="setP(\'{det}\',\'{k}\',this.value)">'
-                f'</div>'
-            )
-        return "".join(rows)
-
-    thresh_sliders = _slider_html(THRESH_PARAMS.items(), "thresh")
-    canny_sliders = _slider_html(CANNY_PARAMS.items(), "canny")
+    def _s(items, det):
+        return "".join(
+            f'<div class="sr"><label>{k} <span id="{det[0]}v_{k}" class="v"></span></label>'
+            f'<input type="range" id="{det[0]}s_{k}" min="{v[0]}" max="{v[1]}" '
+            f'step="{v[2]}" value="{v[3]}" '
+            f'oninput="setP(\'{det}\',\'{k}\',this.value)"></div>'
+            for k, v in items
+        )
 
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>阈值调参工具</title>
+<html><head><meta charset="utf-8"><title>阈值调参</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:monospace;background:#111;color:#ccc;display:flex;height:100vh}}
-#panel{{width:380px;overflow-y:auto;padding:12px;background:#1a1a1a;border-right:1px solid #333}}
+#pn{{width:380px;overflow-y:auto;padding:12px;background:#1a1a1a;border-right:1px solid #333}}
 #main{{flex:1;display:flex;align-items:center;justify-content:center;background:#000}}
 img{{max-width:100%;max-height:100vh;object-fit:contain}}
 h3{{margin:12px 0 6px;font-size:12px;color:#6cf;border-bottom:1px solid #333;padding-bottom:3px}}
-.slider-row{{margin:6px 0}}
-.slider-row label{{display:block;font-size:11px;color:#aaa;margin-bottom:2px}}
-.slider-row input[type=range]{{width:100%}}
-.val{{float:right;color:#0f0;font-size:11px}}
+.sr{{margin:6px 0}}
+.sr label{{display:block;font-size:11px;color:#aaa;margin-bottom:2px}}
+.sr input[type=range]{{width:100%}}
+.v{{float:right;color:#0f0;font-size:11px}}
 .btn{{display:inline-block;margin:3px 2px;padding:5px 9px;background:#2a2a2a;color:#ddd;
-      border:1px solid #444;cursor:pointer;font-size:11px;font-family:monospace}}
+     border:1px solid #444;cursor:pointer;font-size:11px;font-family:monospace}}
 .btn:hover{{background:#3a3a3a}}
 .btn.on{{background:#1a3a1a;border-color:#2a6a2a;color:#8f8}}
-#det_info{{font-size:11px;color:#fa0;margin-top:8px;min-height:14px}}
+#info{{font-size:11px;color:#fa0;margin-top:8px;min-height:14px}}
 </style></head><body>
-<div id="panel">
-<h3>检测器选择</h3>
-<span class="btn on" id="b_thresh" onclick="sw('thresh')">自适应阈值</span>
-<span class="btn" id="b_canny" onclick="sw('canny')">Canny+Hough</span>
+<div id="pn">
+<h3>管道 ROI（黄框范围）</h3>
+<div class="sr"><label>上边界 y1 <span id="roi_v1" class="v">200</span></label>
+<input type="range" id="roi_s1" min="0" max="479" step="1" value="200"
+ oninput="setROI('y1',this.value)"></div>
+<div class="sr"><label>下边界 y2 <span id="roi_v2" class="v">260</span></label>
+<input type="range" id="roi_s2" min="0" max="479" step="1" value="260"
+ oninput="setROI('y2',this.value)"></div>
+<span class="btn" onclick="lockROI()">锁定ROI</span>
+<span id="roi_msg" style="font-size:10px;color:#aaa;margin-left:6px"></span>
 
-<h3>自适应阈值参数</h3>
-<div id="thresh_panel">{thresh_sliders}</div>
+<h3>检测器</h3>
+<span class="btn on" id="b_t" onclick="sw('thresh')">阈值</span>
+<span class="btn" id="b_c" onclick="sw('canny')">Canny</span>
 
-<h3>Canny+Hough 参数</h3>
-<div id="canny_panel">{canny_sliders}</div>
+<h3 id="ph_t">阈值参数</h3>
+<div id="pan_t">{_s(THRESH_PARAMS.items(),'thresh')}</div>
 
-<div id="det_info">--</div>
+<h3 id="ph_c" style="display:none">Canny参数</h3>
+<div id="pan_c" style="display:none">{_s(CANNY_PARAMS.items(),'canny')}</div>
+
+<div id="info">--</div>
 </div>
 <div id="main"><img src="/video_feed"></div>
 
 <script>
-var active = 'thresh';
+var active='thresh';
+function show(det){{
+  ['pan_t','pan_c','ph_t','ph_c'].forEach(function(id){{
+    document.getElementById(id).style.display='none'
+  }})
+  document.getElementById('pan_'+det).style.display='block'
+  document.getElementById('ph_'+det).style.display='block'
+  document.getElementById('b_t').className='btn'+(det==='thresh'?' on':'')
+  document.getElementById('b_c').className='btn'+(det==='canny'?' on':'')
+}}
+var _p={{}},_t={{}};
+function setP(det,k,v){{
+  document.getElementById((det==='thresh'?'tv_':'cv_')+k).textContent=v
+  _p[k]=v; if(_t[k])return
+  _t[k]=setTimeout(function(){{_t[k]=null
+    fetch('/set?'+k+'='+_p[k]).catch(e=>{{}})}},80)
+}}
+function sw(det){{active=det;show(det)
+  fetch('/set?detector='+det).catch(e=>{{}})}}
 
-function showPanel(det){{
-  document.getElementById('thresh_panel').style.display = det==='thresh' ? 'block' : 'none';
-  document.getElementById('canny_panel').style.display = det==='canny' ? 'block' : 'none';
-  document.getElementById('b_thresh').className = 'btn' + (det==='thresh'?' on':'');
-  document.getElementById('b_canny').className = 'btn' + (det==='canny'?' on':'');
+var _r={{}};
+function setROI(k,v){{
+  document.getElementById('roi_v'+(k==='y1'?'1':'2')).textContent=v
+  _r[k]=v
+  clearTimeout(_r.timer)
+  _r.timer=setTimeout(function(){{
+    fetch('/set_roi?'+k+'='+(_r[k]||document.getElementById('roi_s'+(k==='y1'?'1':'2')).value))
+    .catch(e=>{{}})}},60)
 }}
 
-var pending = {{}}, timers = {{}};
-function setP(det, key, val){{
-  document.getElementById((det==='thresh'?'tv_':'cv_')+key).textContent = val;
-  pending[key] = val;
-  if(timers[key]) return;
-  timers[key] = setTimeout(function(){{
-    timers[key] = null;
-    fetch('/set?'+key+'='+pending[key]).catch(e=>{{}});
-  }}, 60);
-}}
-
-function sw(det){{
-  active = det;
-  showPanel(det);
-  fetch('/set?detector='+det).catch(e=>{{}});
+function lockROI(){{
+  fetch('/lock_roi').then(r=>r.json()).then(function(d){{
+    document.getElementById('roi_msg').textContent=d.ok?'已保存':'失败'
+    setTimeout(function(){{document.getElementById('roi_msg').textContent=''}},3000)
+  }}).catch(e=>{{}})
 }}
 
 function poll(){{
   fetch('/stats').then(r=>r.json()).then(function(d){{
-    document.getElementById('det_info').textContent = d.detected + '  ' + d.fps + ' fps';
+    document.getElementById('info').textContent=d.detected+'  '+d.fps+' fps'
+    document.getElementById('roi_v1').textContent=d.roi.y1
+    document.getElementById('roi_v2').textContent=d.roi.y2
+    document.getElementById('roi_s1').value=d.roi.y1
+    document.getElementById('roi_s2').value=d.roi.y2
     for(var k in d.params){{
-      var el = document.getElementById((active==='thresh'?'tv_':'cv_')+k);
-      if(el) el.textContent = d.params[k];
+      var el=document.getElementById((active==='thresh'?'tv_':'cv_')+k)
+      if(el) el.textContent=d.params[k]
     }}
-  }}).catch(e=>{{}});
+  }}).catch(e=>{{}})
 }}
 
-showPanel('thresh');
-poll();
-setInterval(poll, 1000);
-</script>
-</body></html>"""
+show('thresh');poll();setInterval(poll,1000)
+</script></body></html>"""
 
 
-# ── 路由 ──────────────────────────────────────────────────────────────
+# ── 路由 ──────────────────────────────────────────────────────
 
 def make_routes():
     def route_stats(**kw):
@@ -389,15 +324,18 @@ def make_routes():
             "detected": STATE["detected"],
             "fps": STATE["fps"],
             "params": STATE["params"],
+            "roi": STATE["roi"],
         })
 
     def route_set(**kw):
         for key in request.args:
             if key == "detector":
-                det = request.args[key]
-                if det in DETECTORS:
-                    STATE["detector"] = det
-                    STATE["params"] = {k: v[3] for k, v in PARAM_SETS[det].items()}
+                d = request.args[key]
+                if d in DETECTORS:
+                    STATE["detector"] = d
+                    STATE["params"] = {k: v[3] for k, v in
+                                       (THRESH_PARAMS if d == "thresh"
+                                        else CANNY_PARAMS).items()}
                 continue
             if key in STATE["params"]:
                 try:
@@ -406,16 +344,52 @@ def make_routes():
                     pass
         return jsonify({"ok": True})
 
-    return {"/stats": route_stats, "/set": route_set}
+    def route_set_roi(**kw):
+        for key in request.args:
+            if key in ("y1", "y2"):
+                try:
+                    STATE["roi"][key] = max(0, min(int(request.args[key]),
+                                                   OUTPUT_H - 1))
+                except ValueError:
+                    pass
+        return jsonify({"ok": True, "roi": STATE["roi"]})
+
+    def route_lock_roi(**kw):
+        if CALIB_FILE.exists():
+            try:
+                calib = json.loads(CALIB_FILE.read_text())
+            except (json.JSONDecodeError, OSError):
+                calib = {}
+        else:
+            calib = {}
+        calib["pipe_roi_y1"] = STATE["roi"]["y1"]
+        calib["pipe_roi_y2"] = STATE["roi"]["y2"]
+        calibrate.save(calib)
+        return jsonify({"ok": True, "roi": STATE["roi"]})
+
+    return {
+        "/stats": route_stats,
+        "/set": route_set,
+        "/set_roi": route_set_roi,
+        "/lock_roi": route_lock_roi,
+    }
 
 
-# ── 入口 ──────────────────────────────────────────────────────────────
+# ── 入口 ──────────────────────────────────────────────────────
 
 def main():
-    use_cage = "--cage" in sys.argv
-
     cam = Camera(vflip=True, hflip=True, output_size=(OUTPUT_W, OUTPUT_H))
     cam.start()
+
+    # load existing ROI from calibration if available
+    try:
+        calib = calibrate.load()
+        if calib and "pipe_roi_y1" in calib and "pipe_roi_y2" in calib:
+            STATE["roi"]["y1"] = int(calib["pipe_roi_y1"])
+            STATE["roi"]["y2"] = int(calib["pipe_roi_y2"])
+            print(f"ROI loaded: y1={STATE['roi']['y1']} y2={STATE['roi']['y2']}")
+    except Exception:
+        pass
 
     frame = None
     for _ in range(200):
@@ -433,23 +407,21 @@ def main():
     cam.set_params({"AeEnable": True})
 
     streamer = MjpegStreamer(
-        frame_provider=make_frame_provider(cam),
+        frame_provider=make_provider(cam),
         port=TUNER_PORT, max_fps=30.0,
         custom_template=build_page(),
         custom_routes=make_routes(),
     )
     streamer.start()
-    print(f"阈值调参工具 → http://<pi-ip>:{TUNER_PORT}")
+    print(f"调参工具 → http://<pi-ip>:{TUNER_PORT}")
 
     fps_c, fps_t = 0, time.perf_counter()
-
     try:
         while True:
             time.sleep(0.05)
             fps_c += 1
-            elapsed = time.perf_counter() - fps_t
-            if elapsed >= 1.0:
-                STATE["fps"] = round(fps_c / elapsed, 1)
+            if time.perf_counter() - fps_t >= 1.0:
+                STATE["fps"] = round(fps_c / (time.perf_counter() - fps_t), 1)
                 fps_c, fps_t = 0, time.perf_counter()
     except KeyboardInterrupt:
         pass
