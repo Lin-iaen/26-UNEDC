@@ -82,7 +82,6 @@ def make_frame_provider(cam: Camera):
         frame = cam.read()
         if frame is None:
             return None
-
         if STATE["vflip"] and STATE["hflip"]:
             frame = cv2.flip(frame, -1)
         elif STATE["vflip"]:

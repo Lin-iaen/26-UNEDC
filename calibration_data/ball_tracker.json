@@ -1,0 +1,15 @@
+{
+  "scale": 250.0,
+  "unit": "mm/px",
+  "method": "ball_placement",
+  "pipe_length_mm": 250.0,
+  "pipe_ends_px": [
+    617,
+    300,
+    617,
+    299
+  ],
+  "pipe_axis_deg": -90.0,
+  "image_w": 640,
+  "image_h": 480
+}
