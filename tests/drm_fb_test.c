@@ -291,73 +291,54 @@ int main(int argc, char **argv) {
     }
     printf("crtc: %u\n", crtc_id);
 
-    /* 创建 framebuffer */
-    struct dumb_ctx fb = create_dumb_fb(fd, mode->hdisplay, mode->vdisplay);
+    /* 判断模式：先确定最终分辨率，再一次性设置 */
+    int is_stream = (argc > 3 && strcmp(argv[3], "stream") == 0);
+    int is_hold   = (argc > 3 && strcmp(argv[3], "hold") == 0)
+                  || (argc > 4 && strcmp(argv[4], "hold") == 0);
+    int stream_w  = is_stream && argc > 4 ? atoi(argv[4]) : mode->hdisplay;
+    int stream_h  = is_stream && argc > 5 ? atoi(argv[5]) : mode->vdisplay;
+    int fb_w      = is_stream ? stream_w : mode->hdisplay;
+    int fb_h      = is_stream ? stream_h : mode->vdisplay;
+
+    /* 一次性创建匹配最终分辨率的 framebuffer */
+    struct dumb_ctx fb = create_dumb_fb(fd, fb_w, fb_h);
     if (!fb.map || !fb.fb_id) {
         fprintf(stderr, "failed to create dumb framebuffer\n");
         drmModeFreeConnector(conn);
         close(fd);
         return 1;
     }
-    printf("fb: id=%u pitch=%zu size=%zu\n", fb.fb_id, fb.pitch, fb.size);
+    fprintf(stderr, "fb: %dx%d id=%u pitch=%zu\n",
+            fb_w, fb_h, fb.fb_id, fb.pitch);
 
-    /* Set CRTC — 关键步骤 */
+    /* 构建 final mode — 用 fb 尺寸而非 preferred mode */
+    drmModeModeInfo final_mode = *mode;
+    final_mode.hdisplay = fb_w;
+    final_mode.hsync_start = fb_w + 16;
+    final_mode.hsync_end = fb_w + 16 + 48;
+    final_mode.htotal = fb_w + 16 + 48 + 96;
+    final_mode.vdisplay = fb_h;
+    final_mode.vsync_start = fb_h + 10;
+    final_mode.vsync_end = fb_h + 10 + 2;
+    final_mode.vtotal = fb_h + 10 + 2 + 33;
+    snprintf(final_mode.name, sizeof(final_mode.name), "%dx%d", fb_w, fb_h);
+
+    /* Set CRTC — 一次性设置，避免无线 HDMI 因模式切换断连 */
     if (drmModeSetCrtc(fd, crtc_id, fb.fb_id, 0, 0,
-                       &conn->connector_id, 1, mode) < 0) {
+                       &conn->connector_id, 1, &final_mode) < 0) {
         fprintf(stderr, "drmModeSetCrtc failed: %s\n", strerror(errno));
         munmap(fb.map, fb.size);
         drmModeFreeConnector(conn);
         close(fd);
         return 1;
     }
-    fprintf(stderr, "drmModeSetCrtc OK — HDMI active\n");
+    fprintf(stderr, "drmModeSetCrtc OK — %dx%d@60\n", fb_w, fb_h);
 
-    /* 判断模式 */
-    int is_stream = (argc > 3 && strcmp(argv[3], "stream") == 0);
-    int stream_w = is_stream && argc > 4 ? atoi(argv[4]) : mode->hdisplay;
-    int stream_h = is_stream && argc > 5 ? atoi(argv[5]) : mode->vdisplay;
-    int fb_w = is_stream ? stream_w : mode->hdisplay;
-    int fb_h = is_stream ? stream_h : mode->vdisplay;
+    if (is_hold) {
+        fprintf(stderr, "hold mode: re-setting CRTC on disconnect\n");
+    }
 
     if (is_stream) {
-        /* 在流模式下使用自定义分辨率创建 framebuffer */
-        /* 先释放之前为 preferred mode 创建的 fb */
-        munmap(fb.map, fb.size);
-        drmModeRmFB(fd, fb.fb_id);
-        /* 创建匹配 stream 尺寸的 dumb buffer */
-        struct drm_mode_destroy_dumb dd = {.handle = fb.handle};
-        drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dd);
-
-        fb = create_dumb_fb(fd, fb_w, fb_h);
-        if (!fb.map || !fb.fb_id) {
-            fprintf(stderr, "failed to create stream-sized dumb buffer\n");
-            goto cleanup;
-        }
-        fprintf(stderr, "stream fb: %dx%d id=%u pitch=%zu\n",
-                fb_w, fb_h, fb.fb_id, fb.pitch);
-
-        /* 构建 640x480@60 的 mode info */
-        drmModeModeInfo stream_mode = {
-            .clock = 25175,
-            .hdisplay = fb_w, .hsync_start = fb_w + 16,
-            .hsync_end = fb_w + 16 + 48, .htotal = fb_w + 16 + 48 + 96,
-            .vdisplay = fb_h, .vsync_start = fb_h + 10,
-            .vsync_end = fb_h + 10 + 2, .vtotal = fb_h + 10 + 2 + 33,
-            .vrefresh = 60,
-            .flags = DRM_MODE_FLAG_NHSYNC | DRM_MODE_FLAG_NVSYNC,
-            .type = DRM_MODE_TYPE_DRIVER,
-            .name = "",
-        };
-        snprintf(stream_mode.name, sizeof(stream_mode.name),
-                 "%dx%d", fb_w, fb_h);
-
-        if (drmModeSetCrtc(fd, crtc_id, fb.fb_id, 0, 0,
-                           &conn->connector_id, 1, &stream_mode) < 0) {
-            fprintf(stderr, "drmModeSetCrtc (stream) failed: %s\n",
-                    strerror(errno));
-            goto cleanup;
-        }
-        fprintf(stderr, "stream mode set: %dx%d@60\n", fb_w, fb_h);
         /* 模式 2: 从 stdin 读 BGR24 帧 → 写入 dumb buffer */
         fprintf(stderr, "stream mode: %dx%d BGR24 from stdin\n",
                 stream_w, stream_h);
@@ -417,13 +398,32 @@ int main(int argc, char **argv) {
             }
         }
         free(bgr);
-    } else {
-        /* 模式 1: 静态测试图案 */
-        fill_test_pattern(fb.map, fb_w, fb_h, fb.pitch);
-        fprintf(stderr, "test pattern drawn\n");
+
+        if (is_hold && keep_running) {
+            fprintf(stderr, "stream ended, entering hold mode...\n");
+        }
+    }
+
+    if (!is_stream || is_hold) {
+        if (!is_stream) {
+            /* 模式 1: 静态测试图案 */
+            fill_test_pattern(fb.map, fb_w, fb_h, fb.pitch);
+            fprintf(stderr, "test pattern drawn\n");
+        }
+
         fprintf(stderr, "Press Ctrl+C to stop\n");
 
         while (keep_running) {
+            /* 监测 HDMI 状态，断连时自动重设 CRTC */
+            drmModeConnector *chk = drmModeGetConnector(fd, conn->connector_id);
+            if (chk) {
+                if (chk->connection != DRM_MODE_CONNECTED && keep_running) {
+                    fprintf(stderr, "HDMI disconnected, retrying CRTC...\n");
+                    drmModeSetCrtc(fd, crtc_id, fb.fb_id, 0, 0,
+                                   &conn->connector_id, 1, &final_mode);
+                }
+                drmModeFreeConnector(chk);
+            }
             sleep(1);
         }
     }

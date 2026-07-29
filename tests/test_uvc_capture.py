@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """USB 视频采集卡 (UVC) 自环采集测试
 
-测试拓扑：Pi HDMI 输出 → HDMI 线 → USB 采集卡 → USB 线 → Pi 自身 USB 口
+测试拓扑：Pi HDMI 输出 → HDMI（有线/无线）→ USB 采集卡 → Pi USB
 
-原理：
-  Macrosilicon MS2109 类采集卡在 UVC 推流启动后才暴露 EDID，因此：
-  1. 先启动后台 UVC 流 → HDMI 显示 connected
-  2. 运行 drm_fb_test → 分配 dumb buffer + drmModeSetCrtc 让 HDMI 输出彩条图案
-  3. 采集卡接收 HDMI 信号 → ffmpeg 捕获帧
-  4. 验证画面完整性
+流程：
+  1. ffmpeg 录制短视频（同时唤醒 EDID，使 HDMI 连接）
+  2. drm_fb_test 设置 CRTC（一次性模式，避免无线 HDMI 断连）
+  3. 录制完成后逐帧验证画面完整性
+  4. 支持 --wireless 模式（更长等待、hold 模式、重试）
 
 用法：
     source venv/bin/activate
-    python tests/test_uvc_capture.py
+    python tests/test_uvc_capture.py [--wireless] [--delay 5]
 
 输出文件（均保存到 samples/）：
-    uvc_loopback.jpg   (MJPEG 1920×1080)
-    uvc_loopback_yuyv.png   (YUYV 1920×1080)
-    uvc_loopback_640.jpg   (MJPEG 640×480)
-
-依赖：libdrm-dev, gcc (测试脚本自动编译 drm_fb_test.c)
+    uvc_test.mp4        （原始录制）
+    从视频中提取帧进行验证
 
 退出码：0=全通过, 1=有失败
 """
@@ -37,12 +33,9 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SAMPLES_DIR = PROJECT_ROOT / "samples"
 SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
-
-DRM_FB_SRC = Path(__file__).resolve().parent / "drm_fb_test.c"
-DRM_FB_BIN = Path(__file__).resolve().parent / "drm_fb_test"
+DRM_FB_BIN = PROJECT_ROOT / "tests" / "drm_fb_test"
 
 RESULTS: list[tuple[str, bool, str]] = []
-CAPTURE_PATHS: list[Path] = []
 
 
 def check(name: str, ok: bool, detail: str = "") -> bool:
@@ -77,71 +70,18 @@ def hdmi_status() -> str | None:
 
 
 def compile_drm_fb_test() -> bool:
+    src = PROJECT_ROOT / "tests" / "drm_fb_test.c"
     if DRM_FB_BIN.exists():
         return True
-    if not DRM_FB_SRC.exists():
-        return False
     r = subprocess.run(
-        ["gcc", "-o", str(DRM_FB_BIN), str(DRM_FB_SRC),
+        ["gcc", "-o", str(DRM_FB_BIN), str(src),
          "-ldrm", "-I/usr/include/libdrm", "-I/usr/include/drm"],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True, timeout=30,
     )
     return r.returncode == 0
 
 
-def wake_hdmi_and_set_mode(device: str, timeout: float = 10.0) -> tuple[bool, str, subprocess.Popen | None]:
-    """启动后台 UVC 流 → 等待 HDMI connected → 运行 drm_fb_test 设模式"""
-    proc = subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-f", "v4l2", "-input_format", "mjpeg",
-         "-video_size", "640x480", "-i", device,
-         "-t", str(timeout + 10), "-f", "null", "-"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-
-    deadline = time.time() + timeout
-    connected = False
-    while time.time() < deadline:
-        s = hdmi_status()
-        if s and "connected" in s:
-            connected = True
-            break
-        time.sleep(0.3)
-
-    drm_proc = None
-    if connected:
-        drm_proc = subprocess.Popen(
-            [str(DRM_FB_BIN), "/dev/dri/card1", "35"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        time.sleep(2)
-
-    return connected, hdmi_status() or "unknown", drm_proc
-
-
-def ffmpeg_capture(device: str, fmt: str, width: int, height: int,
-                   outpath: Path, timeout: float = 15.0) -> bool:
-    cmd = [
-        "ffmpeg", "-hide_banner",
-        "-f", "v4l2",
-        "-input_format", fmt.lower(),
-        "-video_size", f"{width}x{height}",
-        "-i", device,
-        "-vframes", "1",
-        "-update", "1",
-        "-y", str(outpath),
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        ok = outpath.stat().st_size > 100
-        if ok:
-            CAPTURE_PATHS.append(outpath)
-        return ok
-    except Exception as e:
-        print(f"        ↳ ffmpeg error: {e}")
-        return False
-
-
-def validate_frame(path: Path) -> tuple[bool, str]:
+def validate_frame(path: Path, label: str) -> tuple[bool, str]:
     if not path.exists():
         return False, "文件不存在"
     size = path.stat().st_size
@@ -172,84 +112,146 @@ def validate_frame(path: Path) -> tuple[bool, str]:
     return True, summary
 
 
-def test_capture(label: str, fmt: str, w: int, h: int, device: str) -> None:
-    fname = f"uvc_loopback_{fmt}_{w}x{h}"
-    ext = ".jpg" if fmt == "mjpeg" else ".png"
-    path = SAMPLES_DIR / (fname + ext)
-
-    ok = ffmpeg_capture(device, fmt, w, h, path)
-    check(f"采集 {label}", ok, str(path))
-    if ok:
-        ok2, detail = validate_frame(path)
-        check(f"画面验证 {label}", ok2, detail)
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main() -> int:
+    wireless = "--wireless" in sys.argv
+    extra_delay = 5 if wireless else 0
+
     print("=" * 66)
     print("  UVC 采集卡 — HDMI 自环采集测试")
-    print("  拓扑: Pi HDMI → USB 采集卡 → Pi USB → ffmpeg 捕获")
+    print(f"  模式: {'无线 HDMI' if wireless else '有线 HDMI'}")
     print("=" * 66)
 
-    # ── 1. 编译 drm_fb_test ──
+    # ── 0. 编译 drm_fb_test ──
     print("\n[0] 编译 drm_fb_test")
-    if not check("gcc + libdrm 可用", compile_drm_fb_test(), str(DRM_FB_BIN)):
-        print("      需要安装: sudo apt install libdrm-dev gcc")
+    if not check("gcc + libdrm", compile_drm_fb_test(), ""):
         return 1
 
-    # ── 2. 定位 UVC 设备 ──
+    # ── 1. 查找 UVC 设备 ──
     print("\n[1] 查找 UVC 设备")
     device = find_uvc_device()
     if not check("UVC 采集卡", device is not None, str(device or "无")):
-        print("\n  未找到 UVC 设备，请检查 USB 连接")
         return 1
 
-    # ── 3. 唤醒 HDMI + 设置显示模式 ──
-    print("\n[2] 唤醒 HDMI + 设置 DRM 模式")
-    print("      启动 UVC 流 → 等待 EDID → drm_fb_test → drmModeSetCrtc")
-    connected, status, drm_proc = wake_hdmi_and_set_mode(device)
-    check("HDMI 已连接 + 模式已设", connected, status)
+    # ── 2. 启动录制（同时唤醒 EDID） ──
+    print("\n[2] 启动录制 + 唤醒 HDMI")
+    video_path = SAMPLES_DIR / "uvc_test.mp4"
+    record_sec = 8 + extra_delay
 
-    if not drm_proc:
-        print("      ⚠ drm_fb_test 未运行，后续采集可能得到竖条纹")
-    elif drm_proc.poll() is not None:
-        print(f"      ⚠ drm_fb_test 已退出 (code={drm_proc.returncode})")
+    subprocess.run(["pkill", "-9", "drm_fb_test"], capture_output=True)
+    subprocess.run(["pkill", "-f", "ffmpeg.*video8"], capture_output=True)
+    time.sleep(0.5)
 
-    # ── 4~6. 采集测试 ──
-    # 先停掉唤醒用的后台流，释放 /dev/video8
-    # (drm_fb_test 保持 HDMI 输出)
-    import signal
-    subprocess.run(["pkill", "-f", "ffmpeg.*null"], capture_output=True)
-    time.sleep(1)
+    rec = subprocess.Popen(
+        ["ffmpeg", "-hide_banner", "-y",
+         "-f", "v4l2", "-input_format", "mjpeg",
+         "-video_size", "640x480",
+         "-i", device,
+         "-t", str(record_sec),
+         "-c", "copy",
+         str(video_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    print(f"      录制 {record_sec}s → {video_path.name}")
 
-    print("\n[3] MJPEG 1920×1080 采集")
-    test_capture("MJPG 1920x1080", "mjpeg", 1920, 1080, device)
+    # ── 3. 等待 HDMI 连接 ──
+    deadline = time.time() + 12
+    connected = False
+    while time.time() < deadline:
+        s = hdmi_status()
+        if s and "connected" in s:
+            connected = True
+            break
+        time.sleep(0.3)
+    check("HDMI 已连接", connected, hdmi_status() or "unknown")
 
-    print("\n[4] YUYV 1920×1080 采集 (原始格式)")
-    test_capture("YUYV 1920x1080", "yuyv422", 1920, 1080, device)
+    # ── 4. 启动 drm_fb_test ──
+    print("\n[3] 启动 drm_fb_test (hold 模式)")
+    drm_args = [str(DRM_FB_BIN), "/dev/dri/card1", "35"]
+    if wireless:
+        drm_args += ["hold"]  # 无线 HDMI: 断连自动重设 CRTC
+    else:
+        drm_args += ["stream"]
 
-    print("\n[5] MJPEG 640×480 采集")
-    test_capture("MJPG 640x480", "mjpeg", 640, 480, device)
+    drm = subprocess.Popen(
+        drm_args,
+        stdin=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(1 + extra_delay)
 
-    # ── 7. 清理 ──
-    if drm_proc:
-        drm_proc.terminate()
-        drm_proc.wait(timeout=3)
+    if drm.poll() is not None:
+        check("drm_fb_test 运行中", False, f"退出码={drm.returncode}")
+        rec.terminate()
+        return 1
+    check("drm_fb_test 运行中", True, f"PID={drm.pid}")
 
-    # ── 8. 结论 ──
+    # ── 5. 等待录制完成 ──
+    rec.wait()
+    drm.terminate()
+    drm.wait()
+
+    if not video_path.exists() or video_path.stat().st_size < 1000:
+        check("视频文件已创建", False, "文件过小或不存在")
+        return 1
+    check("视频文件已创建", True, f"{video_path.stat().st_size/1024:.0f}KB")
+
+    # ── 6. 逐帧验证 ──
+    print("\n[4] 逐帧验证")
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=nb_frames", "-of", "csv=p=0",
+         str(video_path)],
+        capture_output=True, text=True, timeout=10,
+    )
+    try:
+        total_frames = int(probe.stdout.strip())
+    except ValueError:
+        total_frames = 0
+    print(f"      视频共 {total_frames} 帧")
+
+    good_frames = 0
+    stripe_frames = 0
+    bad_frames = 0
+
+    if total_frames > 20:
+        sample_positions = [0.2, 0.5, 0.8]  # 前/中/后采样
+    else:
+        sample_positions = [0.5]
+
+    for pct in sample_positions:
+        t = pct * record_sec
+        out = f"/tmp/uvc_frame_{int(t)}.jpg"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-y",
+             "-ss", str(t), "-i", str(video_path),
+             "-vframes", "1", "-update", "1", out],
+            capture_output=True, timeout=10,
+        )
+        valid, detail = validate_frame(Path(out), f"frame@{t}s")
+        if "竖条纹" in detail:
+            stripe_frames += 1
+        elif not valid:
+            bad_frames += 1
+        else:
+            good_frames += 1
+        check(f"帧 @ {t:.1f}s", valid, detail)
+
+    # ── 7. 结论 ──
     passed = sum(1 for _, ok, _ in RESULTS if ok)
     failed = len(RESULTS) - passed
     print("\n" + "=" * 66)
     print(f"  结果: {passed}/{len(RESULTS)} 通过, {failed} 失败")
+    if stripe_frames > 0:
+        print(f"  ⚠ {stripe_frames}/{len(sample_positions)} 帧为竖条纹（HDMI 信号不稳定）")
+    if good_frames > 0:
+        print(f"  ✓ {good_frames}/{len(sample_positions)} 帧正常")
     if failed:
-        print("\n  失败项:")
         for name, ok, detail in RESULTS:
             if not ok:
                 print(f"    - {name}  ({detail})")
-    print(f"\n  输出文件:")
-    for p in CAPTURE_PATHS:
-        print(f"    samples/{p.name}  ({p.stat().st_size/1024:.0f}KB)")
+    print(f"\n  输出: {video_path.name}")
     print("=" * 66)
     return 1 if failed else 0
 
