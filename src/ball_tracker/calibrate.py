@@ -105,6 +105,7 @@ def load() -> dict | None:
 def save(calib: dict) -> None:
     CALIB_DIR.mkdir(parents=True, exist_ok=True)
     CALIB_FILE.write_text(json.dumps(calib, indent=2))
+    CALIB_FILE.chmod(0o666)
     print(f"Saved to {CALIB_FILE}")
 
 

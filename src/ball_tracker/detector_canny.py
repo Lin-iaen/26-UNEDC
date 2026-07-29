@@ -1,3 +1,6 @@
+"""Canny + HoughCircles 检测器 — 完整矩形 ROI + 颜色对比 + 边界校验。
+"""
+
 import cv2
 import numpy as np
 
@@ -5,25 +8,26 @@ import numpy as np
 def detect(frame: np.ndarray,
            pipe_roi: dict | None = None,
            ball_radius_px_range: tuple[int, int] = (8, 40),
-           ) -> tuple[int | None, int | None,
-                      int | None, np.ndarray | None]:
-    """Canny + HoughCircles 检测，只接受落在管道ROI内的圆。
-
-    过滤条件：
-      1. 半径在 ball_radius_px_range 内
-      2. 圆心在 pipe_roi 内（如果有）
-      3. 圆内部比外部暗（颜色对比度）
-    """
+           ) -> tuple[int | None, int | None, int | None, np.ndarray | None]:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    if pipe_roi is not None and pipe_roi["y1"] < pipe_roi["y2"]:
-        y1, y2 = pipe_roi["y1"], pipe_roi["y2"]
-        roi_gray = gray[y1:y2, :]
-        origin_y = y1
-    else:
-        roi_gray = gray
-        y1 = 0
-        origin_y = 0
+    ox = oy = 0
+    x1 = y1 = 0
+    x2 = frame.shape[1]
+    y2 = frame.shape[0]
+    use_roi = False
+
+    if pipe_roi is not None:
+        rx1 = max(0, pipe_roi.get("x1", 0))
+        ry1 = max(0, pipe_roi.get("y1", 0))
+        rx2 = min(frame.shape[1], pipe_roi.get("x2", frame.shape[1]))
+        ry2 = min(frame.shape[0], pipe_roi.get("y2", frame.shape[0]))
+        if rx1 < rx2 and ry1 < ry2:
+            x1, y1, x2, y2 = rx1, ry1, rx2, ry2
+            ox, oy = x1, y1
+            use_roi = True
+
+    roi_gray = gray[y1:y2, x1:x2] if use_roi else gray
 
     blurred = cv2.GaussianBlur(roi_gray, (5, 5), 1.2)
     edges = cv2.Canny(blurred, 30, 100)
@@ -40,15 +44,13 @@ def detect(frame: np.ndarray,
 
     best_cx, best_cy, best_r = None, None, None
     best_contrast = 1e9
+    h_r, w_r = roi_gray.shape[:2]
 
     for c in circles[0]:
         cx, cy, r = int(c[0]), int(c[1]), int(c[2])
-
         if r < ball_radius_px_range[0] or r > ball_radius_px_range[1]:
             continue
 
-        # colour contrast: interior must be darker than exterior
-        h_r, w_r = roi_gray.shape[:2]
         margin = r // 3
         iy0 = max(0, cy - r + margin)
         iy1 = min(h_r, cy + r - margin)
@@ -76,6 +78,17 @@ def detect(frame: np.ndarray,
 
         if (in_mean - out_mean) < best_contrast:
             best_contrast = in_mean - out_mean
-            best_cx, best_cy, best_r = cx, cy + origin_y, r
+            best_cx, best_cy, best_r = cx, cy, r
+
+    if best_cx is None:
+        return (None, None, None, edges)
+
+    best_cx += ox
+    best_cy += oy
+
+    if use_roi:
+        if (best_cx - best_r < x1 or best_cx + best_r > x2 or
+            best_cy - best_r < y1 or best_cy + best_r > y2):
+            return (None, None, None, edges)
 
     return (best_cx, best_cy, best_r, edges)

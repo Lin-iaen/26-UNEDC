@@ -40,9 +40,8 @@ THRESH_PARAMS = {
     "blockSize": (11, 51, 2, 21),
     "C": (2, 20, 1, 4),
     "morph_size": (1, 15, 2, 5),
-    "min_area": (10, 500, 10, 50),
-    "max_area": (500, 150000, 1000, 90000),
-    "circularity": (0.1, 1.0, 0.05, 0.4),
+    "min_area": (10, 500, 5, 50),
+    "max_area": (100, 5000, 100, 800),
 }
 
 CANNY_PARAMS = {
@@ -55,7 +54,7 @@ CANNY_PARAMS = {
 STATE = {
     "detector": "thresh",
     "params": {k: v[3] for k, v in THRESH_PARAMS.items()},
-    "roi": {"y1": DEFAULT_Y1, "y2": DEFAULT_Y2},
+    "roi": {"y1": 180, "y2": 260, "x1": 0, "x2": OUTPUT_W - 1, "locked": False},
     "detected": "-",
     "fps": 0.0,
     "dbg": {},
@@ -64,16 +63,26 @@ STATE = {
 
 # ── 检测器 (简化版: 只找暗块, 丢掉形状约束) ──────────────────
 
-def detect_thresh(frame, y1, y2, p):
+def detect_thresh(frame, roi, p):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    roi_gray = gray[y1:y2, :] if y1 < y2 else gray
-    offset = y1 if y1 < y2 else 0
+    ry1, ry2 = roi["y1"], roi["y2"]
+    rx1, rx2 = roi["x1"], roi["x2"]
+    if rx1 < rx2 and ry1 < ry2:
+        roi_gray = gray[ry1:ry2, rx1:rx2]
+        ox, oy = rx1, ry1
+    else:
+        roi_gray = gray
+        ox = oy = 0
 
     blurred = cv2.GaussianBlur(roi_gray, (7, 7), 1.5)
-    _, binary = cv2.threshold(blurred, 0, 255,
-                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    ksize = int(p["morph_size"]) | 1
+    blk = max(3, int(p["blockSize"])) | 1
+    binary = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, blk, float(p["C"]),
+    )
+
+    ksize = max(1, int(p["morph_size"])) | 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
     closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -83,12 +92,13 @@ def detect_thresh(frame, y1, y2, p):
     h, w = roi_gray.shape[:2]
     min_a = float(p["min_area"])
     max_a = float(p["max_area"])
+    limit = max_a if max_a < h * w * 0.3 else h * w * 0.3
     best_cnt = None
     best_area = 0
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < min_a or area > max_a or area > h * w * 0.3:
+        if area < min_a or area > limit:
             continue
         if area > best_area:
             best_area = area
@@ -98,14 +108,20 @@ def detect_thresh(frame, y1, y2, p):
     if best_cnt is not None:
         (cx, cy), radius = cv2.minEnclosingCircle(best_cnt)
         info += f"  已识别 area={best_area:.0f}"
-        return closed, int(cx), int(cy) + offset, int(radius), info
+        return closed, int(cx) + ox, int(cy) + oy, int(radius), info
     return closed, None, None, None, info
 
 
-def detect_canny(frame, y1, y2, p):
+def detect_canny(frame, roi, p):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    roi_gray = gray[y1:y2, :] if y1 < y2 else gray
-    offset = y1 if y1 < y2 else 0
+    ry1, ry2 = roi["y1"], roi["y2"]
+    rx1, rx2 = roi["x1"], roi["x2"]
+    if rx1 < rx2 and ry1 < ry2:
+        roi_gray = gray[ry1:ry2, rx1:rx2]
+        ox, oy = rx1, ry1
+    else:
+        roi_gray = gray
+        ox = oy = 0
 
     blurred = cv2.GaussianBlur(roi_gray, (5, 5), 1.2)
     edges = cv2.Canny(blurred, int(p["low"]), int(p["high"]))
@@ -118,7 +134,7 @@ def detect_canny(frame, y1, y2, p):
 
     if circles is not None and len(circles[0]) > 0:
         c = circles[0][0]
-        return edges, int(c[0]), int(c[1]) + offset, int(c[2]), \
+        return edges, int(c[0]) + ox, int(c[1]) + oy, int(c[2]), \
             f"已识别 {len(circles[0])} 个圆"
     return edges, None, None, None, \
         f"无圆 (low={int(p['low'])} high={int(p['high'])})"
@@ -146,11 +162,14 @@ def make_provider(cam):
         det = STATE["detector"]
         p = STATE["params"]
         roi = STATE["roi"]
-        y1, y2 = roi["y1"], roi["y2"]
-        if y1 >= y2:
-            y1, y2 = 0, frame.shape[0]
+        proc, cx, cy, r, info = DETECTORS[det](frame, roi, p)
 
-        proc, cx, cy, r, info = DETECTORS[det](frame, y1, y2, p)
+        # 边界检查：圆不能超出 ROI
+        x1, y1, x2, y2 = roi["x1"], roi["y1"], roi["x2"], roi["y2"]
+        if cx is not None and x1 < x2 and y1 < y2:
+            if cx - r < x1 or cx + r > x2 or cy - r < y1 or cy + r > y2:
+                cx = cy = r = None
+                info += "  X 超出ROI"
 
         h, w = frame.shape[:2]
 
@@ -166,9 +185,9 @@ def make_provider(cam):
         out_frame = frame.copy()
 
         # ── ROI 矩形 ─────────────────────────────────────
-        cv2.rectangle(out_frame, (0, y1), (w, y2), (255, 200, 0), 2)
-        cv2.putText(out_frame, f"ROI {y1}-{y2}",
-                    (4, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.rectangle(out_frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
+        cv2.putText(out_frame, f"ROI {x1},{y1}-{x2},{y2}",
+                    (x1 + 4, max(y1 - 6, 12)), cv2.FONT_HERSHEY_SIMPLEX,
                     0.35, (255, 200, 0), 1)
 
         # ── 球标注 ───────────────────────────────────────
@@ -184,10 +203,14 @@ def make_provider(cam):
                 cv2.line(proc_bgr, (cx, yy), (cx, min(yy + 4, h - 1)),
                          (0, 200, 0), 1)
             label = f"[{det}]  ({cx},{cy}) r={r}  {info}"
-            STATE["detected"] = f"({cx},{cy}) r={r}  已识别  |  ROI {y1}-{y2}"
+            STATE["detected"] = (f"({cx},{cy}) r={r}  已识别\n"
+                                 f"ROI x{roi['x1']}-x{roi['x2']} "
+                                 f"y{roi['y1']}-y{roi['y2']}")
         else:
             label = f"[{det}]  {info}"
-            STATE["detected"] = f"{info}  |  ROI {y1}-{y2}"
+            STATE["detected"] = (f"{info}\n"
+                                 f"ROI x{roi['x1']}-x{roi['x2']} "
+                                 f"y{roi['y1']}-y{roi['y2']}")
 
         out = np.hstack((out_frame, proc_bgr))
 
@@ -237,12 +260,18 @@ h3{{margin:12px 0 6px;font-size:12px;color:#6cf;border-bottom:1px solid #333;pad
 </style></head><body>
 <div id="pn">
 <h3>管道 ROI（黄框范围）</h3>
-<div class="sr"><label>上边界 y1 <span id="roi_v1" class="v">200</span></label>
+ <div class="sr"><label>上边界 y1 <span id="roi_v1" class="v">200</span></label>
 <input type="range" id="roi_s1" min="0" max="479" step="1" value="200"
  oninput="setROI('y1',this.value)"></div>
 <div class="sr"><label>下边界 y2 <span id="roi_v2" class="v">260</span></label>
 <input type="range" id="roi_s2" min="0" max="479" step="1" value="260"
  oninput="setROI('y2',this.value)"></div>
+<div class="sr"><label>左边界 x1 <span id="roi_v3" class="v">0</span></label>
+<input type="range" id="roi_s3" min="0" max="639" step="1" value="0"
+ oninput="setROI('x1',this.value)"></div>
+<div class="sr"><label>右边界 x2 <span id="roi_v4" class="v">639</span></label>
+<input type="range" id="roi_s4" min="0" max="639" step="1" value="639"
+ oninput="setROI('x2',this.value)"></div>
 <span class="btn" onclick="lockROI()">锁定ROI</span>
 <span id="roi_msg" style="font-size:10px;color:#aaa;margin-left:6px"></span>
 
@@ -266,8 +295,8 @@ function show(det){{
   ['pan_t','pan_c','ph_t','ph_c'].forEach(function(id){{
     document.getElementById(id).style.display='none'
   }})
-  document.getElementById('pan_'+det).style.display='block'
-  document.getElementById('ph_'+det).style.display='block'
+  document.getElementById('pan_'+det[0]).style.display='block'
+  document.getElementById('ph_'+det[0]).style.display='block'
   document.getElementById('b_t').className='btn'+(det==='thresh'?' on':'')
   document.getElementById('b_c').className='btn'+(det==='canny'?' on':'')
 }}
@@ -283,12 +312,14 @@ function sw(det){{active=det;show(det)
 
 var _r={{}};
 function setROI(k,v){{
-  document.getElementById('roi_v'+(k==='y1'?'1':'2')).textContent=v
-  _r[k]=v
-  clearTimeout(_r.timer)
+  var idx = {{'y1':1,'y2':2,'x1':3,'x2':4}}[k];
+  document.getElementById('roi_v'+idx).textContent=v;
+  _r[k]=v;
+  clearTimeout(_r.timer);
   _r.timer=setTimeout(function(){{
-    fetch('/set_roi?'+k+'='+(_r[k]||document.getElementById('roi_s'+(k==='y1'?'1':'2')).value))
-    .catch(e=>{{}})}},60)
+    fetch('/set_roi?'+k+'='+(_r[k]||
+      document.getElementById('roi_s'+idx).value)).catch(e=>{{}})
+  }},60);
 }}
 
 function lockROI(){{
@@ -300,14 +331,15 @@ function lockROI(){{
 
 function poll(){{
   fetch('/stats').then(r=>r.json()).then(function(d){{
-    document.getElementById('info').textContent=d.detected+'  '+d.fps+' fps'
-    document.getElementById('roi_v1').textContent=d.roi.y1
-    document.getElementById('roi_v2').textContent=d.roi.y2
-    document.getElementById('roi_s1').value=d.roi.y1
-    document.getElementById('roi_s2').value=d.roi.y2
+    document.getElementById('info').textContent=d.detected+'  '+d.fps+' fps';
+    ['roi_s1','roi_s2','roi_s3','roi_s4'].forEach(function(id,i){{
+      var key=['y1','y2','x1','x2'][i];
+      document.getElementById('roi_v'+(i+1)).textContent=d.roi[key];
+      document.getElementById(id).value=d.roi[key];
+    }})
     for(var k in d.params){{
-      var el=document.getElementById((active==='thresh'?'tv_':'cv_')+k)
-      if(el) el.textContent=d.params[k]
+      var el=document.getElementById((active==='thresh'?'tv_':'cv_')+k);
+      if(el) el.textContent=d.params[k];
     }}
   }}).catch(e=>{{}})
 }}
@@ -346,10 +378,10 @@ def make_routes():
 
     def route_set_roi(**kw):
         for key in request.args:
-            if key in ("y1", "y2"):
+            if key in ("y1", "y2", "x1", "x2"):
                 try:
-                    STATE["roi"][key] = max(0, min(int(request.args[key]),
-                                                   OUTPUT_H - 1))
+                    limit = OUTPUT_H - 1 if key.startswith("y") else OUTPUT_W - 1
+                    STATE["roi"][key] = max(0, min(int(request.args[key]), limit))
                 except ValueError:
                     pass
         return jsonify({"ok": True, "roi": STATE["roi"]})
@@ -362,8 +394,8 @@ def make_routes():
                 calib = {}
         else:
             calib = {}
-        calib["pipe_roi_y1"] = STATE["roi"]["y1"]
-        calib["pipe_roi_y2"] = STATE["roi"]["y2"]
+        for k in ("x1", "x2", "y1", "y2"):
+            calib[f"pipe_roi_{k}"] = STATE["roi"][k]
         calibrate.save(calib)
         return jsonify({"ok": True, "roi": STATE["roi"]})
 

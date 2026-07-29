@@ -86,9 +86,11 @@ def main():
     if calib and "pipe_roi_y1" in calib and "pipe_roi_y2" in calib:
         y1 = int(calib["pipe_roi_y1"])
         y2 = int(calib["pipe_roi_y2"])
-        if 0 <= y1 < y2 <= frame0.shape[0]:
-            roi = {"y1": y1, "y2": y2}
-            print(f"Pipe ROI: y1={y1} y2={y2}")
+        x1 = int(calib.get("pipe_roi_x1", 0))
+        x2 = int(calib.get("pipe_roi_x2", frame0.shape[1] - 1))
+        if 0 <= y1 < y2 <= frame0.shape[0] and 0 <= x1 < x2:
+            roi = {"y1": y1, "y2": y2, "x1": x1, "x2": x2}
+            print(f"Pipe ROI: x{x1}-x{x2} y{y1}-y{y2}")
 
     ser = serial_out.SerialOut(SERIAL_PORT)
     print(f"Serial: {SERIAL_PORT} @ 115200")
@@ -145,9 +147,8 @@ def main():
                 ser.send(pos_mm)
 
             if roi:
-                y1, y2 = roi["y1"], roi["y2"]
-                cv2.rectangle(frame, (0, y1), (frame.shape[1], y2),
-                              (255, 200, 0), 2)
+                x1, y1, x2, y2 = roi["x1"], roi["y1"], roi["x2"], roi["y2"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 200, 0), 2)
 
             out = display.draw_overlay(frame, cx, cy, radius, pos_mm,
                                        current_fps, debug_img, debug_mode)
