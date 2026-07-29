@@ -182,6 +182,84 @@ sudo usermod -aG video $USER
 
 采集卡本身有 1-2 帧延迟（约 30-60ms），这是硬件特性。降低分辨率可以减少延迟。
 
+## HDMI 实时输出（无桌面环境）
+
+如果要把采集卡收到的画面实时显示到 HDMI 显示屏上（Pi 无桌面，没有 X11/Wayland），有三种方式。
+
+### 方式一：GStreamer + kmssink（推荐，一行命令）
+
+```bash
+sudo apt install gstreamer1.0-tools gstreamer1.0-plugins-base \
+                 gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+
+# 实时显示采集卡画面到 HDMI
+gst-launch-1.0 v4l2src device=/dev/video0 ! \
+    image/jpeg,width=1920,height=1080,framerate=30/1 ! \
+    jpegdec ! videoconvert ! \
+    kmssink driver-name=vc4 plane-id=0
+
+# 录屏 + 实时显示同时进行（用 tee 分流）
+gst-launch-1.0 v4l2src device=/dev/video0 ! \
+    image/jpeg,width=640,height=480 ! \
+    jpegdec ! videoconvert ! \
+    tee name=t ! \
+        queue ! kmssink driver-name=vc4 plane-id=0 \
+        t. ! queue ! \
+            x264enc ! mp4mux ! filesink location=recording.mp4
+```
+
+### 方式二：uvc_to_drm（C 程序，低延迟）
+
+本仓库提供 `src/uvc_to_drm.c`，直接从 V4L2 读 YUYV 帧 → 转换 RGB → DRM/KMS 输出。
+
+```bash
+# 编译
+gcc -o uvc_to_drm src/uvc_to_drm.c -ldrm \
+    -I/usr/include/libdrm -I/usr/include/drm
+
+# 运行（采集卡画面实时显示到 HDMI）
+sudo ./uvc_to_drm /dev/video0 /dev/dri/card1 640x480
+
+# 或 1080p
+sudo ./uvc_to_drm /dev/video0 /dev/dri/card1 1920x1080
+
+# Ctrl+C 退出
+```
+
+**原理**：
+
+```
+USB 采集卡 → /dev/video0 → YUYV → RGB → dumb buffer → DRM → HDMI 显示屏
+```
+
+无桌面、无 X11、无 Wayland，直接在 DRM 层操作。依赖仅 `libdrm-dev` + `gcc`。
+
+### 方式三：ffmpeg → pipe → drm_fb_test（灵活）
+
+利用已有的 `tests/drm_fb_test` stream 模式：
+
+```bash
+# 终端 1：启动 drm_fb_test 等待帧数据
+./tests/drm_fb_test /dev/dri/card1 35 stream 640 480
+
+# 终端 2：ffmpeg 解码并 pipe 进去
+ffmpeg -f v4l2 -input_format mjpeg -video_size 640x480 -i /dev/video0 \
+       -f rawvideo -pix_fmt bgr24 - \
+       | ./tests/drm_fb_test /dev/dri/card1 35 stream 640 480
+```
+
+此方式可利用 MJPEG 硬件解码（采集卡负责解压），减少 CPU 负载。
+
+### 方式比较
+
+| 方式 | 延迟 | CPU 负载 | 依赖 | 复杂度 |
+|---|---|---|---|---|
+| GStreamer kmssink | 低 | 中 | gstreamer 全套 | 低（一行命令） |
+| uvc_to_drm | 最低 | 低（YUYV 直转） | libdrm-dev | 低（编译一次） |
+| ffmpeg + pipe | 中 | 低（MJPEG 硬解） | libdrm-dev, ffmpeg | 中 |
+
+**推荐**：快速上手用 GStreamer，低延迟用 `uvc_to_drm`。
+
 ## 进阶：树莓派 5 自环采集
 
 在 Pi 5 上实现「HDMI 输出 → 采集卡 → USB 回自己」需要额外的步骤：
@@ -197,10 +275,20 @@ sudo usermod -aG video $USER
 python tests/record_hdmi_loopback.py --duration 10 --size 640x480
 ```
 
+## 配套脚本
+
+```bash
+# 快捷脚本（一键检测、采帧、录制）
+bash scripts/uvc_capture_helper.sh --snapshot frame.jpg
+bash scripts/uvc_capture_helper.sh --record 10 video.mp4
+```
+
 ## 配套文件
 
 | 文件 | 说明 |
 |---|---|
-| `tests/test_uvc_capture.py` | UVC 采集卡自动测试脚本 |
-| `tests/drm_fb_test.c` | DRM dumb buffer + drmModeSetCrtc（Pi 5自环用） |
+| `src/uvc_to_drm.c` | V4L2 采集卡 → DRM 直出 HDMI（编译: gcc + libdrm） |
+| `tests/drm_fb_test.c` | DRM dumb buffer + drmModeSetCrtc（Pi 5自环/通用） |
+| `tests/test_uvc_capture.py` | UVC 采集卡自动测试 + 自环采集 |
 | `tests/record_hdmi_loopback.py` | 摄像头→HDMI→采集卡→录制（Pi 5自环用） |
+| `scripts/uvc_capture_helper.sh` | 采集卡快捷助手（检测/采帧/录制） |
