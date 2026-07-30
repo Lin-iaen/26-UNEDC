@@ -51,10 +51,16 @@ CANNY_PARAMS = {
     "maxR": (20, 100, 1, 40),
 }
 
+CAM_PARAMS = {
+    "ExposureTime": (100, 66000, 100, 30000),
+    "AnalogueGain": (1.0, 16.0, 0.1, 3.0),
+}
+
 STATE = {
     "detector": "thresh",
     "params": {k: v[3] for k, v in THRESH_PARAMS.items()},
-    "roi": {"y1": 180, "y2": 260, "x1": 0, "x2": OUTPUT_W - 1, "locked": False},
+    "cam": {k: v[3] for k, v in CAM_PARAMS.items()},
+    "roi": {"y1": 180, "y2": 260, "x1": 0, "x2": OUTPUT_W - 1},
     "detected": "-",
     "fps": 0.0,
     "dbg": {},
@@ -259,9 +265,19 @@ h3{{margin:12px 0 6px;font-size:12px;color:#6cf;border-bottom:1px solid #333;pad
 #info{{font-size:11px;color:#fa0;margin-top:8px;min-height:14px}}
 </style></head><body>
 <div id="pn">
+<h3>相机参数（AE=关闭）</h3>
+<div class="sr"><label>ExposureTime μs <span id="ev_et" class="v">30000</span></label>
+<input type="range" id="es_et" min="100" max="66000" step="100" value="30000"
+ oninput="setCam('ExposureTime',this.value)"></div>
+<div class="sr"><label>AnalogueGain x <span id="ev_ag" class="v">3.0</span></label>
+<input type="range" id="es_ag" min="1.0" max="16.0" step="0.1" value="3.0"
+ oninput="setCam('AnalogueGain',this.value)"></div>
+<span class="btn" onclick="aeOn()">开启AE</span>
+<span id="ae_msg" style="font-size:10px;color:#aaa;margin-left:6px"></span>
+
 <h3>管道 ROI（黄框范围）</h3>
- <div class="sr"><label>上边界 y1 <span id="roi_v1" class="v">200</span></label>
-<input type="range" id="roi_s1" min="0" max="479" step="1" value="200"
+<div class="sr"><label>上边界 y1 <span id="roi_v1" class="v">180</span></label>
+<input type="range" id="roi_s1" min="0" max="479" step="1" value="180"
  oninput="setROI('y1',this.value)"></div>
 <div class="sr"><label>下边界 y2 <span id="roi_v2" class="v">260</span></label>
 <input type="range" id="roi_s2" min="0" max="479" step="1" value="260"
@@ -310,18 +326,30 @@ function setP(det,k,v){{
 function sw(det){{active=det;show(det)
   fetch('/set?detector='+det).catch(e=>{{}})}}
 
+var _cam={{}},_ct={{}};
+function setCam(k,v){{
+  document.getElementById('ev_'+(k==='ExposureTime'?'et':'ag')).textContent=v
+  _cam[k]=v; if(_ct[k])return
+  _ct[k]=setTimeout(function(){{_ct[k]=null
+    fetch('/set_cam?'+k+'='+_cam[k]).catch(e=>{{}})}},60)
+}}
+function aeOn(){{
+  fetch('/ae_on').then(r=>r.json()).then(function(d){{
+    document.getElementById('ae_msg').textContent='AE已开启'
+    setTimeout(function(){{document.getElementById('ae_msg').textContent=''}},3000)
+  }}).catch(e=>{{}})
+}}
+
 var _r={{}};
 function setROI(k,v){{
-  var idx = {{'y1':1,'y2':2,'x1':3,'x2':4}}[k];
+  var idx={{'y1':1,'y2':2,'x1':3,'x2':4}}[k];
   document.getElementById('roi_v'+idx).textContent=v;
   _r[k]=v;
   clearTimeout(_r.timer);
   _r.timer=setTimeout(function(){{
-    fetch('/set_roi?'+k+'='+(_r[k]||
-      document.getElementById('roi_s'+idx).value)).catch(e=>{{}})
-  }},60);
+    fetch('/set_roi?'+k+'='+(_r[k]||document.getElementById('roi_s'+idx).value))
+    .catch(e=>{{}})}},60);
 }}
-
 function lockROI(){{
   fetch('/lock_roi').then(r=>r.json()).then(function(d){{
     document.getElementById('roi_msg').textContent=d.ok?'已保存':'失败'
@@ -337,6 +365,12 @@ function poll(){{
       document.getElementById('roi_v'+(i+1)).textContent=d.roi[key];
       document.getElementById(id).value=d.roi[key];
     }})
+    if(d.cam){{
+      document.getElementById('ev_et').textContent=d.cam.ExposureTime;
+      document.getElementById('es_et').value=d.cam.ExposureTime;
+      document.getElementById('ev_ag').textContent=d.cam.AnalogueGain;
+      document.getElementById('es_ag').value=d.cam.AnalogueGain;
+    }}
     for(var k in d.params){{
       var el=document.getElementById((active==='thresh'?'tv_':'cv_')+k);
       if(el) el.textContent=d.params[k];
@@ -350,12 +384,13 @@ show('thresh');poll();setInterval(poll,1000)
 
 # ── 路由 ──────────────────────────────────────────────────────
 
-def make_routes():
+def make_routes(cam):
     def route_stats(**kw):
         return jsonify({
             "detected": STATE["detected"],
             "fps": STATE["fps"],
             "params": STATE["params"],
+            "cam": STATE["cam"],
             "roi": STATE["roi"],
         })
 
@@ -374,6 +409,22 @@ def make_routes():
                     STATE["params"][key] = float(request.args[key])
                 except ValueError:
                     pass
+        return jsonify({"ok": True})
+
+    def route_set_cam(**kw):
+        for key in request.args:
+            if key in CAM_PARAMS:
+                try:
+                    val = float(request.args[key])
+                    ctrl = {key: int(val) if key == "ExposureTime" else val}
+                    cam.set_params(ctrl)
+                    STATE["cam"][key] = val
+                except (ValueError, Exception):
+                    pass
+        return jsonify({"ok": True, "cam": STATE["cam"]})
+
+    def route_ae_on(**kw):
+        cam.set_params({"AeEnable": True})
         return jsonify({"ok": True})
 
     def route_set_roi(**kw):
@@ -402,6 +453,8 @@ def make_routes():
     return {
         "/stats": route_stats,
         "/set": route_set,
+        "/set_cam": route_set_cam,
+        "/ae_on": route_ae_on,
         "/set_roi": route_set_roi,
         "/lock_roi": route_lock_roi,
     }
@@ -416,10 +469,15 @@ def main():
     # load existing ROI from calibration if available
     try:
         calib = calibrate.load()
-        if calib and "pipe_roi_y1" in calib and "pipe_roi_y2" in calib:
-            STATE["roi"]["y1"] = int(calib["pipe_roi_y1"])
-            STATE["roi"]["y2"] = int(calib["pipe_roi_y2"])
-            print(f"ROI loaded: y1={STATE['roi']['y1']} y2={STATE['roi']['y2']}")
+        if calib:
+            if "pipe_roi_y1" in calib and "pipe_roi_y2" in calib:
+                STATE["roi"]["y1"] = int(calib["pipe_roi_y1"])
+                STATE["roi"]["y2"] = int(calib["pipe_roi_y2"])
+            if "pipe_roi_x1" in calib and "pipe_roi_x2" in calib:
+                STATE["roi"]["x1"] = int(calib["pipe_roi_x1"])
+                STATE["roi"]["x2"] = int(calib["pipe_roi_x2"])
+            print(f"ROI loaded: x{STATE['roi']['x1']}-x{STATE['roi']['x2']} "
+                  f"y{STATE['roi']['y1']}-y{STATE['roi']['y2']}")
     except Exception:
         pass
 
@@ -436,13 +494,17 @@ def main():
 
     print(f"Camera: {frame.shape[1]}x{frame.shape[0]}")
     cam.switch_sensor_mode(SENSOR_MODE)
-    cam.set_params({"AeEnable": True})
+    cam.set_params({
+        "AeEnable": False,
+        "ExposureTime": int(STATE["cam"]["ExposureTime"]),
+        "AnalogueGain": STATE["cam"]["AnalogueGain"],
+    })
 
     streamer = MjpegStreamer(
         frame_provider=make_provider(cam),
         port=TUNER_PORT, max_fps=30.0,
         custom_template=build_page(),
-        custom_routes=make_routes(),
+        custom_routes=make_routes(cam),
     )
     streamer.start()
     print(f"调参工具 → http://<pi-ip>:{TUNER_PORT}")

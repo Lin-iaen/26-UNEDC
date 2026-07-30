@@ -1,4 +1,5 @@
 from .camera import Camera
-from .base_can_motor import BaseCANMotor
+from .uart import UartController
+from .picofoc_motor import PicoFOCMotor
 
-__all__ = ["Camera", "BaseCANMotor"]
+__all__ = ["Camera", "UartController", "PicoFOCMotor"]

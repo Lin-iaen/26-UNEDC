@@ -23,7 +23,7 @@ from picamera2 import Picamera2
 
 logger = logging.getLogger("drivers.camera")
 
-DEFAULT_EXPOSURE_TIME = 30000
+DEFAULT_EXPOSURE_TIME = 5000
 DEFAULT_ANALOGUE_GAIN = 3.0
 DEFAULT_BRIGHTNESS = 0.0
 DEFAULT_CONTRAST = 1.0

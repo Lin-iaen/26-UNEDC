@@ -29,7 +29,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.drivers import Camera, BaseCANMotor  # noqa: E402 — after sys.path bootstrap
+from src.drivers import Camera, PicoFOCMotor  # noqa: E402 — after sys.path bootstrap
 from src.vision import BaseTracker, MjpegStreamer  # noqa: E402
 
 logger = logging.getLogger("main")
@@ -187,7 +187,7 @@ def _display_loop(
 def _lab_main(shutdown: ShutdownFlag) -> None:
     """Lab mode: camera + MJPEG streamer for LAN tuning."""
     camera: Camera | None = None
-    motor: BaseCANMotor | None = None
+    motor: PicoFOCMotor | None = None
     tracker: BaseTracker | None = None
 
     _latest_annotated: np.ndarray | None = None
@@ -275,7 +275,7 @@ def _lab_main(shutdown: ShutdownFlag) -> None:
 
 def _field_main(shutdown: ShutdownFlag, camera: Camera) -> None:
     """Field mode: vision processing loop (LCD updated by separate thread)."""
-    motor: BaseCANMotor | None = None
+    motor: PicoFOCMotor | None = None
     tracker: BaseTracker | None = None
 
     state = State.IDLE
